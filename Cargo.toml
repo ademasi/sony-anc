@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "sony-anc",
+  "sony-wf1000xm5",
+]
+resolver = "2"
