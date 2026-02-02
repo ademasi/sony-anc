@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.94"
+anyhow = "1.0.100"
 bluer = { version = "0.17.4", features = ["full"] }
-clap = { version = "4.5.20", features = ["derive"] }
+clap = { version = "4.5.56", features = ["derive"] }
 futures = "0.3.31"
-serde = { version = "1.0.215", features = ["derive"] }
-serde_json = "1.0.133"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 sony-wf1000xm5 = { path = "../sony-wf1000xm5" }
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
