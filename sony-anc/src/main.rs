@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use sony_wf1000xm5::{
-    command::{AncMode, Command},
+    command::{AncMode, BatteryType, Command, EqualizerPreset},
     frame_parser::{FrameParser, FrameParserResult},
-    payload::{Payload, parse_payload},
+    payload::{BatteryLevel, Payload, parse_payload},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -48,6 +48,55 @@ enum Action {
         #[arg(value_enum)]
         mode: AncCliMode,
     },
+    /// Show battery levels
+    Battery,
+    /// Show current audio codec
+    Codec,
+    /// Show or change equalizer settings
+    Equalizer {
+        #[command(subcommand)]
+        action: Option<EqualizerAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EqualizerAction {
+    /// Show current equalizer settings (default)
+    Get,
+    /// Switch to a preset
+    Preset {
+        #[arg(value_enum)]
+        preset: CliEqualizerPreset,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliEqualizerPreset {
+    Off,
+    Bright,
+    Excited,
+    Mellow,
+    Relaxed,
+    Vocal,
+    TrebleBoost,
+    BassBoost,
+    Speech,
+}
+
+impl From<CliEqualizerPreset> for EqualizerPreset {
+    fn from(p: CliEqualizerPreset) -> Self {
+        match p {
+            CliEqualizerPreset::Off => EqualizerPreset::Off,
+            CliEqualizerPreset::Bright => EqualizerPreset::Bright,
+            CliEqualizerPreset::Excited => EqualizerPreset::Excited,
+            CliEqualizerPreset::Mellow => EqualizerPreset::Mellow,
+            CliEqualizerPreset::Relaxed => EqualizerPreset::Relaxed,
+            CliEqualizerPreset::Vocal => EqualizerPreset::Vocal,
+            CliEqualizerPreset::TrebleBoost => EqualizerPreset::TrebleBoost,
+            CliEqualizerPreset::BassBoost => EqualizerPreset::BassBoost,
+            CliEqualizerPreset::Speech => EqualizerPreset::Speech,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -147,16 +196,33 @@ async fn run() -> Result<()> {
             print_output(Some(updated));
         }
         Action::Set { mode } => {
-            let status = client
-                .fetch_anc_status()
-                .await
-                .unwrap_or_else(|_| AncState {
-                    mode,
-                    ambient_level: DEFAULT_AMBIENT_LEVEL,
-                });
+            let status = client.fetch_anc_status().await.unwrap_or(AncState {
+                mode,
+                ambient_level: DEFAULT_AMBIENT_LEVEL,
+            });
             let updated = client.set_mode(mode, status.ambient_level).await?;
             print_output(Some(updated));
         }
+        Action::Battery => {
+            let hp = client.fetch_battery(BatteryType::Headphones).await?;
+            let case = client.fetch_battery(BatteryType::Case).await?;
+            print_battery(hp, case);
+        }
+        Action::Codec => {
+            let codec = client.fetch_codec().await?;
+            print_codec(codec);
+        }
+        Action::Equalizer { action } => match action.unwrap_or(EqualizerAction::Get) {
+            EqualizerAction::Get => {
+                let eq = client.fetch_equalizer().await?;
+                print_equalizer(eq);
+            }
+            EqualizerAction::Preset { preset } => {
+                client.set_equalizer_preset(preset.into()).await?;
+                let eq = client.fetch_equalizer().await?;
+                print_equalizer(eq);
+            }
+        },
     }
 
     Ok(())
@@ -190,6 +256,68 @@ fn print_output(state: Option<AncState>) {
             eprintln!("failed to serialize output: {err}");
             println!("--");
         }
+    }
+}
+
+fn print_battery(hp: BatteryLevel, case: BatteryLevel) {
+    let output = match (&hp, &case) {
+        (BatteryLevel::Headphones { left, right }, BatteryLevel::Case(case_pct)) => WaybarOutput {
+            text: format!("L:{left}% R:{right}%"),
+            tooltip: format!("Left: {left}%\nRight: {right}%\nCase: {case_pct}%"),
+            class: "battery".into(),
+        },
+        _ => WaybarOutput {
+            text: format!("{hp:?}"),
+            tooltip: format!("Headphones: {hp:?}\nCase: {case:?}"),
+            class: "battery".into(),
+        },
+    };
+    match serde_json::to_string(&output) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("failed to serialize output: {err}"),
+    }
+}
+
+fn print_codec(codec: sony_wf1000xm5::payload::Codec) {
+    let output = WaybarOutput {
+        text: codec.as_str().to_string(),
+        tooltip: format!("Codec: {}", codec.as_str()),
+        class: "codec".into(),
+    };
+    match serde_json::to_string(&output) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("failed to serialize output: {err}"),
+    }
+}
+
+fn print_equalizer(payload: Payload) {
+    let output = if let Payload::Equalizer {
+        preset,
+        clear_bass,
+        band_400,
+        band_1000,
+        band_2500,
+        band_6300,
+        band_16000,
+    } = payload
+    {
+        WaybarOutput {
+            text: format!("{preset}"),
+            tooltip: format!(
+                "Preset: {preset}\nBass: {clear_bass:+}\n400Hz: {band_400:+}\n1kHz: {band_1000:+}\n2.5kHz: {band_2500:+}\n6.3kHz: {band_6300:+}\n16kHz: {band_16000:+}"
+            ),
+            class: "equalizer".into(),
+        }
+    } else {
+        WaybarOutput {
+            text: "EQ".into(),
+            tooltip: "Unknown equalizer state".into(),
+            class: "equalizer".into(),
+        }
+    };
+    match serde_json::to_string(&output) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("failed to serialize output: {err}"),
     }
 }
 
@@ -270,7 +398,8 @@ impl SonyClient {
         if self.waiting_for_ack {
             return Err(anyhow!("still waiting for ack from previous command"));
         }
-        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number);
+        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number)
+            .context("failed to build command")?;
         self.waiting_for_ack = !matches!(command, Command::Ack);
         self.stream
             .write_all(&bytes)
@@ -334,9 +463,11 @@ impl SonyClient {
                             };
 
                             // respond with ACK
-                            let ack =
-                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num);
-                            let _ = self.stream.write_all(&ack).await;
+                            if let Ok(ack) =
+                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                            {
+                                let _ = self.stream.write_all(&ack).await;
+                            }
 
                             if predicate(&payload) {
                                 return Ok(Some(payload));
@@ -401,6 +532,59 @@ impl SonyClient {
             .wait_for_payload(Duration::from_millis(500), |_| false)
             .await;
         self.fetch_anc_status().await
+    }
+
+    async fn fetch_battery(&mut self, battery_type: BatteryType) -> Result<BatteryLevel> {
+        self.send_command(Command::GetBatteryStatus { battery_type })
+            .await?;
+        let payload = self
+            .wait_for_payload(Duration::from_secs(2), |p| {
+                matches!(p, Payload::BatteryLevel(..))
+            })
+            .await?
+            .ok_or_else(|| anyhow!("no battery level reply"))?;
+
+        if let Payload::BatteryLevel(level) = payload {
+            Ok(level)
+        } else {
+            Err(anyhow!(
+                "unexpected payload while waiting for battery level"
+            ))
+        }
+    }
+
+    async fn fetch_codec(&mut self) -> Result<sony_wf1000xm5::payload::Codec> {
+        self.send_command(Command::GetCodec).await?;
+        let payload = self
+            .wait_for_payload(Duration::from_secs(2), |p| {
+                matches!(p, Payload::Codec { .. })
+            })
+            .await?
+            .ok_or_else(|| anyhow!("no codec reply"))?;
+
+        if let Payload::Codec { codec } = payload {
+            Ok(codec)
+        } else {
+            Err(anyhow!("unexpected payload while waiting for codec"))
+        }
+    }
+
+    async fn fetch_equalizer(&mut self) -> Result<Payload> {
+        self.send_command(Command::GetEqualizerSettings).await?;
+        self.wait_for_payload(Duration::from_secs(2), |p| {
+            matches!(p, Payload::Equalizer { .. })
+        })
+        .await?
+        .ok_or_else(|| anyhow!("no equalizer reply"))
+    }
+
+    async fn set_equalizer_preset(&mut self, preset: EqualizerPreset) -> Result<()> {
+        self.send_command(Command::ChangeEqualizerPreset { preset })
+            .await?;
+        let _ = self
+            .wait_for_payload(Duration::from_millis(500), |_| false)
+            .await;
+        Ok(())
     }
 }
 

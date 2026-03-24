@@ -1,4 +1,17 @@
 use crate::{ESCAPE_BYTE, ESCAPE_MASK, MESSAGE_HEADER, MESSAGE_TRAILER, MessageType, checksum};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("ambient sound level {0} exceeds maximum of 20")]
+    AmbientSoundLevelOutOfRange(usize),
+    #[error("equalizer band value {value} out of range [-10, 10] for {band}")]
+    EqualizerBandOutOfRange { band: &'static str, value: i8 },
+    #[error(
+        "equalizer preset {preset:?} does not support custom settings (use Manual, Custom1, or Custom2)"
+    )]
+    EqualizerPresetNotCustomizable { preset: EqualizerPreset },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EqualizerPreset {
@@ -109,8 +122,8 @@ impl Command {
     const GET_BATTERY_STATUS: u8 = 0x22;
     const EQUALIZER_GET: u8 = 0x56;
     const CODEC_GET: u8 = 0x12;
-    fn to_bytes(&self) -> Vec<u8> {
-        match self {
+    fn to_bytes(&self) -> Result<Vec<u8>, CommandError> {
+        Ok(match self {
             Self::Init => {
                 vec![0, 0]
             }
@@ -126,7 +139,9 @@ impl Command {
                 ambient_sound_level,
             } => {
                 if *ambient_sound_level > 20 {
-                    panic!("ambient sound level should be less than or equal to 20");
+                    return Err(CommandError::AmbientSoundLevelOutOfRange(
+                        *ambient_sound_level,
+                    ));
                 }
                 let mut out = vec![
                     Self::ANC_SET,
@@ -170,16 +185,24 @@ impl Command {
                 band_6300,
                 band_16000,
             } => {
-                assert!(bass_level.abs() <= 10);
-                assert!(band_400.abs() <= 10);
-                assert!(band_1000.abs() <= 10);
-                assert!(band_2500.abs() <= 10);
-                assert!(band_6300.abs() <= 10);
-                assert!(band_16000.abs() <= 10);
-                assert!(matches!(
+                fn check_band(name: &'static str, value: i8) -> Result<(), CommandError> {
+                    if value.abs() > 10 {
+                        return Err(CommandError::EqualizerBandOutOfRange { band: name, value });
+                    }
+                    Ok(())
+                }
+                check_band("bass", *bass_level)?;
+                check_band("400Hz", *band_400)?;
+                check_band("1kHz", *band_1000)?;
+                check_band("2.5kHz", *band_2500)?;
+                check_band("6.3kHz", *band_6300)?;
+                check_band("16kHz", *band_16000)?;
+                if !matches!(
                     preset,
                     EqualizerPreset::Manual | EqualizerPreset::Custom1 | EqualizerPreset::Custom2
-                ));
+                ) {
+                    return Err(CommandError::EqualizerPresetNotCustomizable { preset: *preset });
+                }
 
                 let data_size = 6; // bass level + 5 bands
                 vec![
@@ -217,7 +240,7 @@ impl Command {
                 // from HCI logs: 3e0e01000000025a036e3c
                 vec![0x5a, 0x03]
             }
-        }
+        })
     }
 }
 
@@ -246,8 +269,8 @@ fn push_escaped(vec: &mut Vec<u8>, byte: u8) {
  * following byte masked with MESSAGE_ESCAPE_MASK.
  */
 /// Build a command to send the headphones
-pub fn build_command(command: &Command, seq_number: u8) -> Vec<u8> {
-    let cmd = command.to_bytes();
+pub fn build_command(command: &Command, seq_number: u8) -> Result<Vec<u8>, CommandError> {
+    let cmd = command.to_bytes()?;
     let mut buf = Vec::with_capacity(cmd.len() + 7);
     let message_type = match command {
         Command::AncSet { .. }
@@ -281,7 +304,7 @@ pub fn build_command(command: &Command, seq_number: u8) -> Vec<u8> {
     }
     out.push(MESSAGE_TRAILER);
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -293,7 +316,7 @@ mod test {
         let bytes = [0x3e, 0xc, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0xe, 0x3c];
         assert_eq!(
             bytes.as_slice(),
-            build_command(&Command::Init, 0).as_slice()
+            build_command(&Command::Init, 0).unwrap().as_slice()
         );
     }
     #[test]
@@ -301,7 +324,7 @@ mod test {
         // taken from hci logs
         let ack = [0x3e, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x3c];
         let init_seq_num = 1;
-        let our_ack = build_command(&Command::Ack, init_seq_num);
+        let our_ack = build_command(&Command::Ack, init_seq_num).unwrap();
         assert_eq!(ack.as_slice(), our_ack.as_slice());
     }
 }

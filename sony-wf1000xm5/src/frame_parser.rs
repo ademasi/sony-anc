@@ -163,23 +163,25 @@ mod test {
     #[test]
     fn basic_messages() {
         let good_messages = vec![
-            build_command(&crate::command::Command::GetAncStatus, 0),
-            build_command(&crate::command::Command::GetEqualizerSettings, 0x69),
+            build_command(&crate::command::Command::GetAncStatus, 0).unwrap(),
+            build_command(&crate::command::Command::GetEqualizerSettings, 0x69).unwrap(),
             build_command(
                 &crate::command::Command::GetBatteryStatus {
                     battery_type: crate::command::BatteryType::Headphones,
                 },
                 0x22,
-            ),
+            )
+            .unwrap(),
             build_command(
                 &crate::command::Command::AncSet {
                     dragging_ambient_sound_slider: true,
                     mode: AncMode::AmbientSound,
-                    ambient_sound_voice_filtering: false,
+                    ambient_sound_voice_passthrough: false,
                     ambient_sound_level: 15,
                 },
                 0xe,
-            ),
+            )
+            .unwrap(),
         ];
         let mut parser = FrameParser::new();
         for bytes in good_messages {
