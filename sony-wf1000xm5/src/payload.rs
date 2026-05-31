@@ -404,4 +404,54 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn empty_payload_errors() {
+        assert!(matches!(
+            parse_payload(&[], MessageType::Command1),
+            Err(ParsePayloadError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unknown_payload_type_errors() {
+        assert!(matches!(
+            parse_payload(&[0xff], MessageType::Command1),
+            Err(ParsePayloadError::UnknownPayloadType { kind: 0xff })
+        ));
+    }
+
+    #[test]
+    fn battery_too_small_errors() {
+        // BatteryLevel needs >= 5 bytes
+        assert!(matches!(
+            parse_payload(&[0x23, 0x01], MessageType::Command1),
+            Err(ParsePayloadError::PayloadTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_battery_type_errors() {
+        // 0x05 is not a known battery type
+        assert!(matches!(
+            parse_payload(&[0x23, 0x05, 0, 0, 0], MessageType::Command1),
+            Err(ParsePayloadError::UnknownBatteryType { battery: 0x05 })
+        ));
+    }
+
+    #[test]
+    fn unknown_codec_errors() {
+        assert!(matches!(
+            parse_payload(&[0x13, 0x00, 0x99], MessageType::Command1),
+            Err(ParsePayloadError::UnknownCodec { codec: 0x99 })
+        ));
+    }
+
+    #[test]
+    fn unknown_equalizer_preset_errors() {
+        assert!(matches!(
+            parse_payload(&[0x57, 0x00, 0x99, 0x06, 10, 10, 10, 10, 10, 10], MessageType::Command1),
+            Err(ParsePayloadError::UnknownEqualizerPreset { preset: 0x99 })
+        ));
+    }
 }
