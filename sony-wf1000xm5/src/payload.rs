@@ -246,3 +246,55 @@ pub fn parse_payload(
         }
     })
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::frame_parser::{FrameParser, FrameParserResult};
+
+    /// Run a full HCI frame through the frame parser, then parse its payload.
+    fn decode_frame(frame: &[u8]) -> Payload {
+        let mut parser = FrameParser::new();
+        match parser.parse(frame) {
+            FrameParserResult::Ready { msg, .. } => {
+                assert!(msg.checksum.is_ok(), "frame checksum invalid: {:?}", msg.checksum);
+                let kind = msg.kind.expect("known message type");
+                parse_payload(msg.payload, kind).expect("payload parses")
+            }
+            other => panic!("frame did not complete: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn golden_sound_pressure_measure_on() {
+        // from payload.rs comment: device reports measuring turned on
+        let frame = [
+            0x3e, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x03, 0x01, 0x00, 0x6f, 0x3c,
+        ];
+        assert_eq!(
+            decode_frame(&frame),
+            Payload::SoundPressureMeasureReply { is_on: true }
+        );
+    }
+
+    #[test]
+    fn golden_sound_pressure_measure_off() {
+        // from payload.rs comment: device reports measuring turned off
+        let frame = [
+            0x3e, 0x0e, 0x01, 0x00, 0x00, 0x00, 0x04, 0x59, 0x03, 0x01, 0x01, 0x71, 0x3c,
+        ];
+        assert_eq!(
+            decode_frame(&frame),
+            Payload::SoundPressureMeasureReply { is_on: false }
+        );
+    }
+
+    #[test]
+    fn golden_pressure_get() {
+        // from payload.rs comment: 3e0e01000000045b034203b63c, value byte 0x42 = 66
+        let frame = [
+            0x3e, 0x0e, 0x01, 0x00, 0x00, 0x00, 0x04, 0x5b, 0x03, 0x42, 0x03, 0xb6, 0x3c,
+        ];
+        assert_eq!(decode_frame(&frame), Payload::SoundPressure { db: 66 });
+    }
+}
