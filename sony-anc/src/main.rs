@@ -228,6 +228,14 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Serialize a Waybar output object to stdout, logging serialization failures.
+fn emit(output: WaybarOutput) {
+    match serde_json::to_string(&output) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("failed to serialize output: {err}"),
+    }
+}
+
 fn print_output(state: Option<AncState>) {
     let output = match state {
         Some(state) => {
@@ -250,13 +258,7 @@ fn print_output(state: Option<AncState>) {
         },
     };
 
-    match serde_json::to_string(&output) {
-        Ok(json) => println!("{json}"),
-        Err(err) => {
-            eprintln!("failed to serialize output: {err}");
-            println!("--");
-        }
-    }
+    emit(output);
 }
 
 fn print_battery(hp: BatteryLevel, case: BatteryLevel) {
@@ -272,10 +274,7 @@ fn print_battery(hp: BatteryLevel, case: BatteryLevel) {
             class: "battery".into(),
         },
     };
-    match serde_json::to_string(&output) {
-        Ok(json) => println!("{json}"),
-        Err(err) => eprintln!("failed to serialize output: {err}"),
-    }
+    emit(output);
 }
 
 fn print_codec(codec: sony_wf1000xm5::payload::Codec) {
@@ -284,10 +283,7 @@ fn print_codec(codec: sony_wf1000xm5::payload::Codec) {
         tooltip: format!("Codec: {}", codec.as_str()),
         class: "codec".into(),
     };
-    match serde_json::to_string(&output) {
-        Ok(json) => println!("{json}"),
-        Err(err) => eprintln!("failed to serialize output: {err}"),
-    }
+    emit(output);
 }
 
 fn print_equalizer(payload: Payload) {
@@ -315,10 +311,7 @@ fn print_equalizer(payload: Payload) {
             class: "equalizer".into(),
         }
     };
-    match serde_json::to_string(&output) {
-        Ok(json) => println!("{json}"),
-        Err(err) => eprintln!("failed to serialize output: {err}"),
-    }
+    emit(output);
 }
 
 /// Resolve the ambient sound level to use: fall back to the default when the
