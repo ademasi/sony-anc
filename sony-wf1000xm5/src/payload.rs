@@ -49,13 +49,13 @@ impl PayloadType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BatteryLevel {
     Case(usize),
     Headphones { left: usize, right: usize },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     Unknown = 0,
     Sbc = 0x1,
@@ -89,7 +89,7 @@ impl Codec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Payload {
     InitReply,
     BatteryLevel(BatteryLevel),
