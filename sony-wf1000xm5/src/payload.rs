@@ -257,11 +257,18 @@ mod test {
         let mut parser = FrameParser::new();
         match parser.parse(frame) {
             FrameParserResult::Ready { msg, .. } => {
-                assert!(msg.checksum.is_ok(), "frame checksum invalid: {:?}", msg.checksum);
+                assert!(
+                    msg.checksum.is_ok(),
+                    "frame checksum invalid: {:?}",
+                    msg.checksum
+                );
                 let kind = msg.kind.expect("known message type");
                 parse_payload(msg.payload, kind).expect("payload parses")
             }
-            other => panic!("frame did not complete: {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "frame did not complete: {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -323,7 +330,10 @@ mod test {
         let payload = [0x23, 0x01, 80, 0x00, 85];
         assert_eq!(
             parse_payload(&payload, MessageType::Command1).unwrap(),
-            Payload::BatteryLevel(BatteryLevel::Headphones { left: 80, right: 85 })
+            Payload::BatteryLevel(BatteryLevel::Headphones {
+                left: 80,
+                right: 85
+            })
         );
     }
 
@@ -450,7 +460,10 @@ mod test {
     #[test]
     fn unknown_equalizer_preset_errors() {
         assert!(matches!(
-            parse_payload(&[0x57, 0x00, 0x99, 0x06, 10, 10, 10, 10, 10, 10], MessageType::Command1),
+            parse_payload(
+                &[0x57, 0x00, 0x99, 0x06, 10, 10, 10, 10, 10, 10],
+                MessageType::Command1
+            ),
             Err(ParsePayloadError::UnknownEqualizerPreset { preset: 0x99 })
         ));
     }
