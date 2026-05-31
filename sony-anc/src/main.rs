@@ -47,6 +47,15 @@ enum Action {
     Set {
         #[arg(value_enum)]
         mode: AncCliMode,
+        /// Ambient sound level 0-20 (ambient mode only)
+        #[arg(long)]
+        level: Option<u8>,
+        /// Enable voice passthrough (ambient mode only)
+        #[arg(long, conflicts_with = "no_voice")]
+        voice: bool,
+        /// Disable voice passthrough (ambient mode only)
+        #[arg(long)]
+        no_voice: bool,
     },
     /// Show battery levels
     Battery,
@@ -192,15 +201,29 @@ async fn run() -> Result<()> {
         Action::Cycle { direction } => {
             let status = client.fetch_anc_status().await?;
             let next = cycle_mode(status.mode, direction);
-            let updated = client.set_mode(next, status.ambient_level).await?;
+            let updated = client.set_mode(next, status.ambient_level, None, None).await?;
             print_output(Some(updated));
         }
-        Action::Set { mode } => {
+        Action::Set {
+            mode,
+            level,
+            voice,
+            no_voice,
+        } => {
+            let voice_override = if voice {
+                Some(true)
+            } else if no_voice {
+                Some(false)
+            } else {
+                None
+            };
             let status = client.fetch_anc_status().await.unwrap_or(AncState {
                 mode,
                 ambient_level: DEFAULT_AMBIENT_LEVEL,
             });
-            let updated = client.set_mode(mode, status.ambient_level).await?;
+            let updated = client
+                .set_mode(mode, status.ambient_level, level, voice_override)
+                .await?;
             print_output(Some(updated));
         }
         Action::Battery => {
@@ -321,6 +344,27 @@ fn ambient_level_for(current: u8) -> u8 {
         DEFAULT_AMBIENT_LEVEL
     } else {
         current.min(20)
+    }
+}
+
+/// Compute the (ambient_sound_level, voice_passthrough) pair to send for a target
+/// mode. Only Ambient uses a level/voice; other modes are always (0, false).
+/// `level_override` and `voice_override` come from CLI flags; when absent the
+/// level falls back to `ambient_level_for(current_level)` and voice defaults to true.
+fn ambient_params(
+    target: AncCliMode,
+    current_level: u8,
+    level_override: Option<u8>,
+    voice_override: Option<bool>,
+) -> (u8, bool) {
+    match target {
+        AncCliMode::Ambient => {
+            let level = level_override
+                .unwrap_or_else(|| ambient_level_for(current_level))
+                .min(20);
+            (level, voice_override.unwrap_or(true))
+        }
+        AncCliMode::Anc | AncCliMode::Off => (0, false),
     }
 }
 
@@ -510,13 +554,15 @@ impl SonyClient {
         }
     }
 
-    async fn set_mode(&mut self, target: AncCliMode, current_level: u8) -> Result<AncState> {
-        let level = ambient_level_for(current_level);
-        let (ambient_level, voice_passthrough) = match target {
-            AncCliMode::Anc => (0, false),
-            AncCliMode::Ambient => (level, true),
-            AncCliMode::Off => (0, false),
-        };
+    async fn set_mode(
+        &mut self,
+        target: AncCliMode,
+        current_level: u8,
+        level_override: Option<u8>,
+        voice_override: Option<bool>,
+    ) -> Result<AncState> {
+        let (ambient_level, voice_passthrough) =
+            ambient_params(target, current_level, level_override, voice_override);
 
         let command = Command::AncSet {
             dragging_ambient_sound_slider: false,
@@ -648,5 +694,24 @@ mod tests {
         assert_eq!(cycle_mode(AncCliMode::Anc, CycleDirection::Prev), AncCliMode::Off);
         assert_eq!(cycle_mode(AncCliMode::Off, CycleDirection::Prev), AncCliMode::Ambient);
         assert_eq!(cycle_mode(AncCliMode::Ambient, CycleDirection::Prev), AncCliMode::Anc);
+    }
+
+    #[test]
+    fn ambient_params_defaults() {
+        assert_eq!(ambient_params(AncCliMode::Ambient, 0, None, None), (DEFAULT_AMBIENT_LEVEL, true));
+        assert_eq!(ambient_params(AncCliMode::Ambient, 15, None, None), (15, true));
+    }
+
+    #[test]
+    fn ambient_params_overrides() {
+        assert_eq!(ambient_params(AncCliMode::Ambient, 0, Some(7), None), (7, true));
+        assert_eq!(ambient_params(AncCliMode::Ambient, 0, Some(50), None), (20, true)); // clamped
+        assert_eq!(ambient_params(AncCliMode::Ambient, 0, None, Some(false)), (DEFAULT_AMBIENT_LEVEL, false));
+    }
+
+    #[test]
+    fn ambient_params_non_ambient_modes_zeroed() {
+        assert_eq!(ambient_params(AncCliMode::Anc, 15, Some(7), Some(true)), (0, false));
+        assert_eq!(ambient_params(AncCliMode::Off, 15, Some(7), Some(true)), (0, false));
     }
 }
