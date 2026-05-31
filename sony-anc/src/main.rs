@@ -66,6 +66,8 @@ enum Action {
         #[command(subcommand)]
         action: Option<EqualizerAction>,
     },
+    /// Measure and report ambient sound pressure (dB)
+    Pressure,
 }
 
 #[derive(Debug, Subcommand)]
@@ -270,6 +272,10 @@ async fn run() -> Result<()> {
             let codec = client.fetch_codec().await?;
             print_codec(codec);
         }
+        Action::Pressure => {
+            let db = client.fetch_sound_pressure().await?;
+            print_pressure(db);
+        }
         Action::Equalizer { action } => match action.unwrap_or(EqualizerAction::Get) {
             EqualizerAction::Get => {
                 let eq = client.fetch_equalizer().await?;
@@ -347,6 +353,14 @@ fn print_battery(hp: BatteryLevel, case: BatteryLevel) {
         },
     };
     emit(output);
+}
+
+fn print_pressure(db: usize) {
+    emit(WaybarOutput {
+        text: format!("{db} dB"),
+        tooltip: format!("Sound pressure: {db} dB"),
+        class: "pressure".into(),
+    });
 }
 
 fn print_codec(codec: sony_wf1000xm5::payload::Codec) {
@@ -731,6 +745,36 @@ impl SonyClient {
             .wait_for_payload(Duration::from_millis(500), |_| false)
             .await;
         Ok(())
+    }
+
+    async fn fetch_sound_pressure(&mut self) -> Result<usize> {
+        self.send_command(Command::SoundPressureMeasure { on: true })
+            .await?;
+        self.wait_for_payload(Duration::from_secs(2), |p| {
+            matches!(p, Payload::SoundPressureMeasureReply { .. })
+        })
+        .await?;
+
+        self.send_command(Command::GetSoundPressure).await?;
+        let payload = self
+            .wait_for_payload(Duration::from_secs(2), |p| {
+                matches!(p, Payload::SoundPressure { .. })
+            })
+            .await?
+            .ok_or_else(|| anyhow!("no sound pressure reply"))?;
+
+        // Stop measuring before returning.
+        self.send_command(Command::SoundPressureMeasure { on: false })
+            .await?;
+        let _ = self
+            .wait_for_payload(Duration::from_millis(300), |_| false)
+            .await;
+
+        if let Payload::SoundPressure { db } = payload {
+            Ok(db)
+        } else {
+            Err(anyhow!("unexpected payload while waiting for sound pressure"))
+        }
     }
 }
 
