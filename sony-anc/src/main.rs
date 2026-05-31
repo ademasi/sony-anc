@@ -494,6 +494,12 @@ async fn run_watch(target: &Option<String>) -> Result<()> {
     let mut last: Option<AncCliMode> = None;
     let mut current_level: u8 = DEFAULT_AMBIENT_LEVEL;
 
+    // Emit the disconnected state immediately on startup. Without this, the
+    // `last == None` sentinel collides with the disconnected state (also `None`),
+    // so `emit_anc_if_changed(.., None)` would suppress the first line and the
+    // bar would stay empty until the buds connect.
+    print_output(None);
+
     loop {
         match connect(target).await {
             Ok(Some(mut client)) => {
