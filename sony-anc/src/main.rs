@@ -753,8 +753,24 @@ impl SonyClient {
         self.wait_for_payload(Duration::from_secs(2), |p| {
             matches!(p, Payload::SoundPressureMeasureReply { .. })
         })
-        .await?;
+        .await?
+        .ok_or_else(|| anyhow!("no sound-pressure measure reply from device"))?;
 
+        // Read the value, but always stop measuring afterwards regardless of outcome.
+        let result = self.read_sound_pressure().await;
+
+        // Best-effort stop; don't mask the real result.
+        let _ = self
+            .send_command(Command::SoundPressureMeasure { on: false })
+            .await;
+        let _ = self
+            .wait_for_payload(Duration::from_millis(300), |_| false)
+            .await;
+
+        result
+    }
+
+    async fn read_sound_pressure(&mut self) -> Result<usize> {
         self.send_command(Command::GetSoundPressure).await?;
         let payload = self
             .wait_for_payload(Duration::from_secs(2), |p| {
@@ -762,13 +778,6 @@ impl SonyClient {
             })
             .await?
             .ok_or_else(|| anyhow!("no sound pressure reply"))?;
-
-        // Stop measuring before returning.
-        self.send_command(Command::SoundPressureMeasure { on: false })
-            .await?;
-        let _ = self
-            .wait_for_payload(Duration::from_millis(300), |_| false)
-            .await;
 
         if let Payload::SoundPressure { db } = payload {
             Ok(db)
