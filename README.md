@@ -24,6 +24,15 @@ sony-anc set anc|ambient|off
 
 # target a specific device (name substring or MAC)
 sony-anc --device "WF-1000XM5" status
+
+# stream status continuously (one line per change) for Waybar
+sony-anc watch
+
+# measure ambient sound pressure
+sony-anc pressure
+
+# nudge a single EQ band (writes the Manual preset, keeps other bands)
+sony-anc equalizer set --bass 3
 ```
 
 Environment override: `SONY_WF1000XM5_DEVICE` can be set to a name substring or MAC to pick the device.
@@ -45,6 +54,31 @@ Environment override: `SONY_WF1000XM5_DEVICE` can be set to a name substring or 
 ```
 
 The module shows icons for ANC/Ambient/Off when connected and hides itself when the buds are disconnected (via the `disconnected` class styling). Click or scroll to cycle modes; the signal refresh forces an immediate redraw.
+
+### Streaming mode (recommended)
+
+`watch` holds a single Bluetooth connection open and prints a fresh line on every
+change, so Waybar never polls. Cycle the mode by signaling the running process —
+the buds only accept one app connection at a time, so a second `cycle` process is
+not used.
+
+```jsonc
+"custom/sony_anc": {
+  "format": "{text}",
+  "return-type": "json",
+  "exec": "$HOME/.local/bin/sony-anc watch",
+  "on-click": "pkill -SIGUSR1 -f 'sony-anc watch'",
+  "on-scroll-up": "pkill -SIGUSR1 -f 'sony-anc watch'",
+  "on-scroll-down": "pkill -SIGUSR2 -f 'sony-anc watch'",
+  "tooltip": true
+}
+```
+
+SIGUSR1 cycles to the next mode; SIGUSR2 cycles to the previous mode. When the buds
+disconnect, `watch` emits the `disconnected` class and reconnects automatically.
+
+> A systemd `--user` unit is intentionally **not** provided for `watch`: Waybar must
+> own the process so it can read the streamed stdout.
 
 ## Notes on protocol
 

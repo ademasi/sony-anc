@@ -49,13 +49,13 @@ impl PayloadType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BatteryLevel {
     Case(usize),
     Headphones { left: usize, right: usize },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     Unknown = 0,
     Sbc = 0x1,
@@ -89,7 +89,7 @@ impl Codec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Payload {
     InitReply,
     BatteryLevel(BatteryLevel),
@@ -245,4 +245,226 @@ pub fn parse_payload(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::frame_parser::{FrameParser, FrameParserResult};
+
+    /// Run a full HCI frame through the frame parser, then parse its payload.
+    fn decode_frame(frame: &[u8]) -> Payload {
+        let mut parser = FrameParser::new();
+        match parser.parse(frame) {
+            FrameParserResult::Ready { msg, .. } => {
+                assert!(
+                    msg.checksum.is_ok(),
+                    "frame checksum invalid: {:?}",
+                    msg.checksum
+                );
+                let kind = msg.kind.expect("known message type");
+                parse_payload(msg.payload, kind).expect("payload parses")
+            }
+            other => panic!(
+                "frame did not complete: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn golden_sound_pressure_measure_on() {
+        // from payload.rs comment: device reports measuring turned on
+        let frame = [
+            0x3e, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x03, 0x01, 0x00, 0x6f, 0x3c,
+        ];
+        assert_eq!(
+            decode_frame(&frame),
+            Payload::SoundPressureMeasureReply { is_on: true }
+        );
+    }
+
+    #[test]
+    fn golden_sound_pressure_measure_off() {
+        // from payload.rs comment: device reports measuring turned off
+        let frame = [
+            0x3e, 0x0e, 0x01, 0x00, 0x00, 0x00, 0x04, 0x59, 0x03, 0x01, 0x01, 0x71, 0x3c,
+        ];
+        assert_eq!(
+            decode_frame(&frame),
+            Payload::SoundPressureMeasureReply { is_on: false }
+        );
+    }
+
+    #[test]
+    fn golden_pressure_get() {
+        // from payload.rs comment: 3e0e01000000045b034203b63c, value byte 0x42 = 66
+        let frame = [
+            0x3e, 0x0e, 0x01, 0x00, 0x00, 0x00, 0x04, 0x5b, 0x03, 0x42, 0x03, 0xb6, 0x3c,
+        ];
+        assert_eq!(decode_frame(&frame), Payload::SoundPressure { db: 66 });
+    }
+
+    #[test]
+    fn init_reply() {
+        let payload = [0x01];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::InitReply
+        );
+    }
+
+    #[test]
+    fn battery_case() {
+        // [type=0x23, battery=0x0a (case), value=75, _, _]
+        let payload = [0x23, 0x0a, 75, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Case(75))
+        );
+    }
+
+    #[test]
+    fn battery_headphones() {
+        // left = byte[2], right = byte[4]; byte[3] is intentionally skipped
+        let payload = [0x23, 0x01, 80, 0x00, 85];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Headphones {
+                left: 80,
+                right: 85
+            })
+        );
+    }
+
+    #[test]
+    fn equalizer_decodes_band_offset() {
+        // preset byte[2]=0x10 (Bright); bands at byte[4..10] are stored +10
+        let payload = [0x57, 0x00, 0x10, 0x06, 12, 10, 10, 10, 10, 7];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::Equalizer {
+                preset: EqualizerPreset::Bright,
+                clear_bass: 2,
+                band_400: 0,
+                band_1000: 0,
+                band_2500: 0,
+                band_6300: 0,
+                band_16000: -3,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_off() {
+        // byte[3]==0 -> Off
+        let payload = [0x67, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::Off,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_active_noise_canceling() {
+        // byte[3]!=0 && byte[4]==0 -> ANC
+        let payload = [0x67, 0, 0, 1, 0, 0, 0];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::ActiveNoiseCanceling,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_ambient() {
+        // byte[3]!=0 && byte[4]!=0 -> Ambient; voice=byte[5]==1; level=byte[6]
+        let payload = [0x67, 0, 0, 1, 1, 1, 10];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::AmbientSound,
+                ambient_sound_voice_passthrough: true,
+                ambient_sound_level: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn codec_variants() {
+        for (byte, expected) in [
+            (0x01u8, Codec::Sbc),
+            (0x02, Codec::Aac),
+            (0x10, Codec::Ldac),
+            (0x20, Codec::Aptx),
+            (0x21, Codec::AptxHd),
+            (0x00, Codec::Unknown),
+        ] {
+            let payload = [0x13, 0x00, byte];
+            assert_eq!(
+                parse_payload(&payload, MessageType::Command1).unwrap(),
+                Payload::Codec { codec: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn empty_payload_errors() {
+        assert!(matches!(
+            parse_payload(&[], MessageType::Command1),
+            Err(ParsePayloadError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unknown_payload_type_errors() {
+        assert!(matches!(
+            parse_payload(&[0xff], MessageType::Command1),
+            Err(ParsePayloadError::UnknownPayloadType { kind: 0xff })
+        ));
+    }
+
+    #[test]
+    fn battery_too_small_errors() {
+        // BatteryLevel needs >= 5 bytes
+        assert!(matches!(
+            parse_payload(&[0x23, 0x01], MessageType::Command1),
+            Err(ParsePayloadError::PayloadTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_battery_type_errors() {
+        // 0x05 is not a known battery type
+        assert!(matches!(
+            parse_payload(&[0x23, 0x05, 0, 0, 0], MessageType::Command1),
+            Err(ParsePayloadError::UnknownBatteryType { battery: 0x05 })
+        ));
+    }
+
+    #[test]
+    fn unknown_codec_errors() {
+        assert!(matches!(
+            parse_payload(&[0x13, 0x00, 0x99], MessageType::Command1),
+            Err(ParsePayloadError::UnknownCodec { codec: 0x99 })
+        ));
+    }
+
+    #[test]
+    fn unknown_equalizer_preset_errors() {
+        assert!(matches!(
+            parse_payload(
+                &[0x57, 0x00, 0x99, 0x06, 10, 10, 10, 10, 10, 10],
+                MessageType::Command1
+            ),
+            Err(ParsePayloadError::UnknownEqualizerPreset { preset: 0x99 })
+        ));
+    }
 }
