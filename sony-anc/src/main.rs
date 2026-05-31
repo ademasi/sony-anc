@@ -321,6 +321,16 @@ fn print_equalizer(payload: Payload) {
     }
 }
 
+/// Resolve the ambient sound level to use: fall back to the default when the
+/// device reports 0, otherwise clamp the current level into the valid range.
+fn ambient_level_for(current: u8) -> u8 {
+    if current == 0 {
+        DEFAULT_AMBIENT_LEVEL
+    } else {
+        current.min(20)
+    }
+}
+
 fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
     use AncCliMode as M;
     match direction {
@@ -508,11 +518,7 @@ impl SonyClient {
     }
 
     async fn set_mode(&mut self, target: AncCliMode, current_level: u8) -> Result<AncState> {
-        let level = if current_level == 0 {
-            DEFAULT_AMBIENT_LEVEL
-        } else {
-            current_level.min(20)
-        };
+        let level = ambient_level_for(current_level);
         let (ambient_level, voice_passthrough) = match target {
             AncCliMode::Anc => (0, false),
             AncCliMode::Ambient => (level, true),
@@ -616,4 +622,38 @@ async fn find_device(adapter: &Adapter, hint: Option<&str>) -> Result<Option<Dev
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambient_level_defaults_when_zero() {
+        assert_eq!(ambient_level_for(0), DEFAULT_AMBIENT_LEVEL);
+    }
+
+    #[test]
+    fn ambient_level_clamps_to_twenty() {
+        assert_eq!(ambient_level_for(25), 20);
+    }
+
+    #[test]
+    fn ambient_level_passes_through() {
+        assert_eq!(ambient_level_for(15), 15);
+    }
+
+    #[test]
+    fn cycle_next_rotates_anc_ambient_off() {
+        assert_eq!(cycle_mode(AncCliMode::Anc, CycleDirection::Next), AncCliMode::Ambient);
+        assert_eq!(cycle_mode(AncCliMode::Ambient, CycleDirection::Next), AncCliMode::Off);
+        assert_eq!(cycle_mode(AncCliMode::Off, CycleDirection::Next), AncCliMode::Anc);
+    }
+
+    #[test]
+    fn cycle_prev_rotates_reverse() {
+        assert_eq!(cycle_mode(AncCliMode::Anc, CycleDirection::Prev), AncCliMode::Off);
+        assert_eq!(cycle_mode(AncCliMode::Off, CycleDirection::Prev), AncCliMode::Ambient);
+        assert_eq!(cycle_mode(AncCliMode::Ambient, CycleDirection::Prev), AncCliMode::Anc);
+    }
 }
