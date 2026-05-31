@@ -77,6 +77,24 @@ enum EqualizerAction {
         #[arg(value_enum)]
         preset: CliEqualizerPreset,
     },
+    /// Set custom band levels (-10..10), keeping current values for unset bands
+    Set {
+        /// Custom preset slot to write into
+        #[arg(long, value_enum, default_value_t = CliCustomPreset::Manual)]
+        preset: CliCustomPreset,
+        #[arg(long)]
+        bass: Option<i8>,
+        #[arg(long = "b400")]
+        band_400: Option<i8>,
+        #[arg(long = "b1k")]
+        band_1000: Option<i8>,
+        #[arg(long = "b2.5k")]
+        band_2500: Option<i8>,
+        #[arg(long = "b6.3k")]
+        band_6300: Option<i8>,
+        #[arg(long = "b16k")]
+        band_16000: Option<i8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -104,6 +122,23 @@ impl From<CliEqualizerPreset> for EqualizerPreset {
             CliEqualizerPreset::TrebleBoost => EqualizerPreset::TrebleBoost,
             CliEqualizerPreset::BassBoost => EqualizerPreset::BassBoost,
             CliEqualizerPreset::Speech => EqualizerPreset::Speech,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliCustomPreset {
+    Manual,
+    Custom1,
+    Custom2,
+}
+
+impl From<CliCustomPreset> for EqualizerPreset {
+    fn from(p: CliCustomPreset) -> Self {
+        match p {
+            CliCustomPreset::Manual => EqualizerPreset::Manual,
+            CliCustomPreset::Custom1 => EqualizerPreset::Custom1,
+            CliCustomPreset::Custom2 => EqualizerPreset::Custom2,
         }
     }
 }
@@ -245,6 +280,20 @@ async fn run() -> Result<()> {
                 let eq = client.fetch_equalizer().await?;
                 print_equalizer(eq);
             }
+            EqualizerAction::Set {
+                preset,
+                bass,
+                band_400,
+                band_1000,
+                band_2500,
+                band_6300,
+                band_16000,
+            } => {
+                let overrides = [bass, band_400, band_1000, band_2500, band_6300, band_16000];
+                client.set_equalizer_bands(preset.into(), overrides).await?;
+                let eq = client.fetch_equalizer().await?;
+                print_equalizer(eq);
+            }
         },
     }
 
@@ -366,6 +415,18 @@ fn ambient_params(
         }
         AncCliMode::Anc | AncCliMode::Off => (0, false),
     }
+}
+
+/// Apply per-band overrides over a baseline curve.
+/// Index order: [bass, 400Hz, 1kHz, 2.5kHz, 6.3kHz, 16kHz].
+fn merge_bands(base: [i8; 6], overrides: [Option<i8>; 6]) -> [i8; 6] {
+    let mut out = base;
+    for (slot, override_value) in out.iter_mut().zip(overrides) {
+        if let Some(v) = override_value {
+            *slot = v;
+        }
+    }
+    out
 }
 
 fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
@@ -631,6 +692,46 @@ impl SonyClient {
             .await;
         Ok(())
     }
+
+    async fn set_equalizer_bands(
+        &mut self,
+        preset: EqualizerPreset,
+        overrides: [Option<i8>; 6],
+    ) -> Result<()> {
+        // Use the device's currently reported curve as the baseline so a single
+        // flag nudges one band instead of zeroing the rest.
+        let base = match self.fetch_equalizer().await? {
+            Payload::Equalizer {
+                clear_bass,
+                band_400,
+                band_1000,
+                band_2500,
+                band_6300,
+                band_16000,
+                ..
+            } => [
+                clear_bass, band_400, band_1000, band_2500, band_6300, band_16000,
+            ],
+            _ => [0; 6],
+        };
+        let [bass_level, band_400, band_1000, band_2500, band_6300, band_16000] =
+            merge_bands(base, overrides);
+
+        self.send_command(Command::ChangeEqualizerSetting {
+            preset,
+            bass_level,
+            band_400,
+            band_1000,
+            band_2500,
+            band_6300,
+            band_16000,
+        })
+        .await?;
+        let _ = self
+            .wait_for_payload(Duration::from_millis(500), |_| false)
+            .await;
+        Ok(())
+    }
 }
 
 async fn find_device(adapter: &Adapter, hint: Option<&str>) -> Result<Option<Device>> {
@@ -713,5 +814,18 @@ mod tests {
     fn ambient_params_non_ambient_modes_zeroed() {
         assert_eq!(ambient_params(AncCliMode::Anc, 15, Some(7), Some(true)), (0, false));
         assert_eq!(ambient_params(AncCliMode::Off, 15, Some(7), Some(true)), (0, false));
+    }
+
+    #[test]
+    fn merge_bands_applies_only_overrides() {
+        let base = [1i8, 2, 3, 4, 5, 6];
+        let overrides = [Some(9), None, None, None, None, Some(-9)];
+        assert_eq!(merge_bands(base, overrides), [9, 2, 3, 4, 5, -9]);
+    }
+
+    #[test]
+    fn merge_bands_no_overrides_keeps_base() {
+        let base = [0i8, 0, 0, 0, 0, 0];
+        assert_eq!(merge_bands(base, [None; 6]), base);
     }
 }
