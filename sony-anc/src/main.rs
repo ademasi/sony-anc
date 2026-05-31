@@ -68,6 +68,8 @@ enum Action {
     },
     /// Measure and report ambient sound pressure (dB)
     Pressure,
+    /// Stream ANC status to stdout on every change (Waybar continuous exec)
+    Watch,
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +224,10 @@ async fn run() -> Result<()> {
         .or_else(|| std::env::var("SONY_WF1000XM5_DEVICE").ok());
     let action = cli.action.unwrap_or(Action::Status);
 
+    if matches!(action, Action::Watch) {
+        return run_watch(&target).await;
+    }
+
     let mut client = match connect(&target).await? {
         Some(client) => client,
         None => {
@@ -238,7 +244,9 @@ async fn run() -> Result<()> {
         Action::Cycle { direction } => {
             let status = client.fetch_anc_status().await?;
             let next = cycle_mode(status.mode, direction);
-            let updated = client.set_mode(next, status.ambient_level, None, None).await?;
+            let updated = client
+                .set_mode(next, status.ambient_level, None, None)
+                .await?;
             print_output(Some(updated));
         }
         Action::Set {
@@ -301,9 +309,26 @@ async fn run() -> Result<()> {
                 print_equalizer(eq);
             }
         },
+        Action::Watch => unreachable!("watch is dispatched before connect"),
     }
 
     Ok(())
+}
+
+/// Whether a new ANC mode differs from the last emitted one (dedupes output,
+/// including repeated disconnected states represented as `None`).
+fn should_emit(last: Option<AncCliMode>, new: Option<AncCliMode>) -> bool {
+    last != new
+}
+
+/// Emit a Waybar line only when the ANC mode changed since the last emission.
+/// `None` represents the disconnected state.
+fn emit_anc_if_changed(last: &mut Option<AncCliMode>, state: Option<&AncState>) {
+    let mode = state.map(|s| s.mode);
+    if should_emit(*last, mode) {
+        *last = mode;
+        print_output(state.cloned());
+    }
 }
 
 /// Serialize a Waybar output object to stdout, logging serialization failures.
@@ -456,6 +481,39 @@ fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
             M::Ambient => M::Anc,
             M::Off => M::Ambient,
         },
+    }
+}
+
+/// Long-lived watch loop: hold one connection, stream ANC changes to stdout,
+/// react to SIGUSR1 (cycle next) / SIGUSR2 (cycle prev), and reconnect forever.
+async fn run_watch(target: &Option<String>) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sig_next = signal(SignalKind::user_defined1())?;
+    let mut sig_prev = signal(SignalKind::user_defined2())?;
+    let mut last: Option<AncCliMode> = None;
+    let mut current_level: u8 = DEFAULT_AMBIENT_LEVEL;
+
+    loop {
+        match connect(target).await {
+            Ok(Some(mut client)) => {
+                if let Ok(state) = client.fetch_anc_status().await {
+                    current_level = state.ambient_level;
+                    emit_anc_if_changed(&mut last, Some(&state));
+                }
+                if let Err(e) = client
+                    .watch_loop(&mut sig_next, &mut sig_prev, &mut last, &mut current_level)
+                    .await
+                {
+                    eprintln!("sony-anc watch: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("sony-anc watch: connect failed: {e}"),
+        }
+        // Mark disconnected (emits once) and back off before reconnecting.
+        emit_anc_if_changed(&mut last, None);
+        time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -728,8 +786,14 @@ impl SonyClient {
             ],
             _ => [0; 6],
         };
-        let [bass_level, band_400, band_1000, band_2500, band_6300, band_16000] =
-            merge_bands(base, overrides);
+        let [
+            bass_level,
+            band_400,
+            band_1000,
+            band_2500,
+            band_6300,
+            band_16000,
+        ] = merge_bands(base, overrides);
 
         self.send_command(Command::ChangeEqualizerSetting {
             preset,
@@ -770,6 +834,102 @@ impl SonyClient {
         result
     }
 
+    /// Feed received bytes through the frame parser, ack any command payloads,
+    /// and return the most recent ANC state observed in this chunk (if any).
+    async fn process_bytes(&mut self, bytes: &[u8]) -> Result<Option<AncState>> {
+        let mut latest: Option<AncState> = None;
+        for byte in bytes {
+            match self.frame_parser.parse(std::slice::from_ref(byte)) {
+                FrameParserResult::Ready { msg, .. } => {
+                    if let Err(e) = msg.checksum {
+                        eprintln!("ignoring bad checksum: {e}");
+                        continue;
+                    }
+                    let Some(kind) = msg.kind.ok() else { continue };
+
+                    if kind == sony_wf1000xm5::MessageType::Ack {
+                        self.seq_number = msg.seq_num;
+                        self.waiting_for_ack = false;
+                        continue;
+                    }
+
+                    if kind == sony_wf1000xm5::MessageType::Command1
+                        || kind == sony_wf1000xm5::MessageType::Command2
+                    {
+                        let payload = match parse_payload(msg.payload, kind) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("bad payload: {e}");
+                                continue;
+                            }
+                        };
+
+                        if let Ok(ack) =
+                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                        {
+                            let _ = self.stream.write_all(&ack).await;
+                        }
+
+                        if let Payload::AncStatus {
+                            mode,
+                            ambient_sound_level,
+                            ..
+                        } = payload
+                        {
+                            latest = Some(AncState {
+                                mode: AncCliMode::from_anc_mode(mode),
+                                ambient_level: ambient_sound_level,
+                            });
+                        }
+                    }
+                }
+                FrameParserResult::Incomplete { .. } => {}
+                FrameParserResult::Error { err, .. } => {
+                    return Err(anyhow!("frame parser error: {err}"));
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    async fn watch_loop(
+        &mut self,
+        sig_next: &mut tokio::signal::unix::Signal,
+        sig_prev: &mut tokio::signal::unix::Signal,
+        last: &mut Option<AncCliMode>,
+        current_level: &mut u8,
+    ) -> Result<()> {
+        let mut buf = [0u8; 64];
+        loop {
+            tokio::select! {
+                read = self.stream.read(&mut buf) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Err(anyhow!("connection closed"));
+                    }
+                    if let Some(state) = self.process_bytes(&buf[..n]).await? {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
+                    }
+                }
+                _ = sig_next.recv() => {
+                    let next = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
+                    if let Ok(state) = self.set_mode(next, *current_level, None, None).await {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
+                    }
+                }
+                _ = sig_prev.recv() => {
+                    let prev = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
+                    if let Ok(state) = self.set_mode(prev, *current_level, None, None).await {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
+                    }
+                }
+            }
+        }
+    }
+
     async fn read_sound_pressure(&mut self) -> Result<usize> {
         self.send_command(Command::GetSoundPressure).await?;
         let payload = self
@@ -782,7 +942,9 @@ impl SonyClient {
         if let Payload::SoundPressure { db } = payload {
             Ok(db)
         } else {
-            Err(anyhow!("unexpected payload while waiting for sound pressure"))
+            Err(anyhow!(
+                "unexpected payload while waiting for sound pressure"
+            ))
         }
     }
 }
@@ -838,35 +1000,74 @@ mod tests {
 
     #[test]
     fn cycle_next_rotates_anc_ambient_off() {
-        assert_eq!(cycle_mode(AncCliMode::Anc, CycleDirection::Next), AncCliMode::Ambient);
-        assert_eq!(cycle_mode(AncCliMode::Ambient, CycleDirection::Next), AncCliMode::Off);
-        assert_eq!(cycle_mode(AncCliMode::Off, CycleDirection::Next), AncCliMode::Anc);
+        assert_eq!(
+            cycle_mode(AncCliMode::Anc, CycleDirection::Next),
+            AncCliMode::Ambient
+        );
+        assert_eq!(
+            cycle_mode(AncCliMode::Ambient, CycleDirection::Next),
+            AncCliMode::Off
+        );
+        assert_eq!(
+            cycle_mode(AncCliMode::Off, CycleDirection::Next),
+            AncCliMode::Anc
+        );
     }
 
     #[test]
     fn cycle_prev_rotates_reverse() {
-        assert_eq!(cycle_mode(AncCliMode::Anc, CycleDirection::Prev), AncCliMode::Off);
-        assert_eq!(cycle_mode(AncCliMode::Off, CycleDirection::Prev), AncCliMode::Ambient);
-        assert_eq!(cycle_mode(AncCliMode::Ambient, CycleDirection::Prev), AncCliMode::Anc);
+        assert_eq!(
+            cycle_mode(AncCliMode::Anc, CycleDirection::Prev),
+            AncCliMode::Off
+        );
+        assert_eq!(
+            cycle_mode(AncCliMode::Off, CycleDirection::Prev),
+            AncCliMode::Ambient
+        );
+        assert_eq!(
+            cycle_mode(AncCliMode::Ambient, CycleDirection::Prev),
+            AncCliMode::Anc
+        );
     }
 
     #[test]
     fn ambient_params_defaults() {
-        assert_eq!(ambient_params(AncCliMode::Ambient, 0, None, None), (DEFAULT_AMBIENT_LEVEL, true));
-        assert_eq!(ambient_params(AncCliMode::Ambient, 15, None, None), (15, true));
+        assert_eq!(
+            ambient_params(AncCliMode::Ambient, 0, None, None),
+            (DEFAULT_AMBIENT_LEVEL, true)
+        );
+        assert_eq!(
+            ambient_params(AncCliMode::Ambient, 15, None, None),
+            (15, true)
+        );
     }
 
     #[test]
     fn ambient_params_overrides() {
-        assert_eq!(ambient_params(AncCliMode::Ambient, 0, Some(7), None), (7, true));
-        assert_eq!(ambient_params(AncCliMode::Ambient, 0, Some(50), None), (20, true)); // clamped
-        assert_eq!(ambient_params(AncCliMode::Ambient, 0, None, Some(false)), (DEFAULT_AMBIENT_LEVEL, false));
+        assert_eq!(
+            ambient_params(AncCliMode::Ambient, 0, Some(7), None),
+            (7, true)
+        );
+        assert_eq!(
+            ambient_params(AncCliMode::Ambient, 0, Some(50), None),
+            (20, true)
+        ); // clamped
+        assert_eq!(
+            ambient_params(AncCliMode::Ambient, 0, None, Some(false)),
+            (DEFAULT_AMBIENT_LEVEL, false)
+        );
     }
 
     #[test]
     fn ambient_params_non_ambient_modes_zeroed() {
-        assert_eq!(ambient_params(AncCliMode::Anc, 15, Some(7), Some(true)), (0, false));
-        assert_eq!(ambient_params(AncCliMode::Off, 15, Some(7), Some(true)), (0, false));
+        assert_eq!(
+            ambient_params(AncCliMode::Anc, 15, Some(7), Some(true)),
+            (0, false)
+        );
+        assert_eq!(
+            ambient_params(AncCliMode::Off, 15, Some(7), Some(true)),
+            (0, false)
+        );
     }
 
     #[test]
@@ -880,5 +1081,14 @@ mod tests {
     fn merge_bands_no_overrides_keeps_base() {
         let base = [0i8, 0, 0, 0, 0, 0];
         assert_eq!(merge_bands(base, [None; 6]), base);
+    }
+
+    #[test]
+    fn should_emit_only_on_change() {
+        assert!(should_emit(None, Some(AncCliMode::Anc)));
+        assert!(should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Off)));
+        assert!(should_emit(Some(AncCliMode::Anc), None));
+        assert!(!should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Anc)));
+        assert!(!should_emit(None, None));
     }
 }
