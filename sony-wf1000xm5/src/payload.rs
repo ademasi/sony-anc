@@ -297,4 +297,111 @@ mod test {
         ];
         assert_eq!(decode_frame(&frame), Payload::SoundPressure { db: 66 });
     }
+
+    #[test]
+    fn init_reply() {
+        let payload = [0x01];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::InitReply
+        );
+    }
+
+    #[test]
+    fn battery_case() {
+        // [type=0x23, battery=0x0a (case), value=75, _, _]
+        let payload = [0x23, 0x0a, 75, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Case(75))
+        );
+    }
+
+    #[test]
+    fn battery_headphones() {
+        // left = byte[2], right = byte[4]; byte[3] is intentionally skipped
+        let payload = [0x23, 0x01, 80, 0x00, 85];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Headphones { left: 80, right: 85 })
+        );
+    }
+
+    #[test]
+    fn equalizer_decodes_band_offset() {
+        // preset byte[2]=0x10 (Bright); bands at byte[4..10] are stored +10
+        let payload = [0x57, 0x00, 0x10, 0x06, 12, 10, 10, 10, 10, 7];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::Equalizer {
+                preset: EqualizerPreset::Bright,
+                clear_bass: 2,
+                band_400: 0,
+                band_1000: 0,
+                band_2500: 0,
+                band_6300: 0,
+                band_16000: -3,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_off() {
+        // byte[3]==0 -> Off
+        let payload = [0x67, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::Off,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_active_noise_canceling() {
+        // byte[3]!=0 && byte[4]==0 -> ANC
+        let payload = [0x67, 0, 0, 1, 0, 0, 0];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::ActiveNoiseCanceling,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn anc_status_ambient() {
+        // byte[3]!=0 && byte[4]!=0 -> Ambient; voice=byte[5]==1; level=byte[6]
+        let payload = [0x67, 0, 0, 1, 1, 1, 10];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::AmbientSound,
+                ambient_sound_voice_passthrough: true,
+                ambient_sound_level: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn codec_variants() {
+        for (byte, expected) in [
+            (0x01u8, Codec::Sbc),
+            (0x02, Codec::Aac),
+            (0x10, Codec::Ldac),
+            (0x20, Codec::Aptx),
+            (0x21, Codec::AptxHd),
+            (0x00, Codec::Unknown),
+        ] {
+            let payload = [0x13, 0x00, byte];
+            assert_eq!(
+                parse_payload(&payload, MessageType::Command1).unwrap(),
+                Payload::Codec { codec: expected }
+            );
+        }
+    }
 }
