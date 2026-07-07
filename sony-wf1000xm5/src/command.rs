@@ -156,30 +156,50 @@ impl Command {
                         *ambient_sound_level,
                     ));
                 }
-                let mut out = vec![
-                    Self::ANC_SET,
-                    Self::SUPPORTS_AMBIENT_SOUND_CONTROL_2,
-                    if *dragging_ambient_sound_slider { 0 } else { 1 },
-                ];
-                if *mode == AncMode::Off {
-                    out.push(0);
-                } else {
-                    out.push(1);
+                match version {
+                    ProtocolVersion::V2 => {
+                        let mut out = vec![
+                            Self::ANC_SET,
+                            Self::SUPPORTS_AMBIENT_SOUND_CONTROL_2,
+                            if *dragging_ambient_sound_slider { 0 } else { 1 },
+                        ];
+                        if *mode == AncMode::Off {
+                            out.push(0);
+                        } else {
+                            out.push(1);
+                        }
+                        if *mode == AncMode::AmbientSound {
+                            out.push(1);
+                        } else {
+                            out.push(0);
+                        }
+                        out.push(if *ambient_sound_voice_passthrough { 1 } else { 0 });
+                        out.push(*ambient_sound_level as u8);
+                        out
+                    }
+                    ProtocolVersion::V1 => {
+                        // WF-1000XM3 wind-capable ambient sound control (fixed 8 bytes).
+                        let mode_flag = if *mode == AncMode::Off { 0x00 } else { 0x11 };
+                        let mode_detail = match mode {
+                            AncMode::ActiveNoiseCanceling => 0x02,
+                            AncMode::AmbientSound | AncMode::Off => 0x00,
+                        };
+                        let level = match mode {
+                            AncMode::Off | AncMode::AmbientSound => *ambient_sound_level as u8,
+                            AncMode::ActiveNoiseCanceling => 0,
+                        };
+                        vec![
+                            Self::ANC_SET,
+                            0x02,
+                            mode_flag,
+                            0x02,
+                            mode_detail,
+                            0x01,
+                            if *ambient_sound_voice_passthrough { 1 } else { 0 },
+                            level,
+                        ]
+                    }
                 }
-
-                if *mode == AncMode::AmbientSound {
-                    out.push(1);
-                } else {
-                    out.push(0);
-                }
-
-                out.push(if *ambient_sound_voice_passthrough {
-                    1
-                } else {
-                    0
-                });
-                out.push(*ambient_sound_level as u8);
-                out
             }
 
             Self::GetAncStatus => match version {
@@ -439,6 +459,39 @@ mod test {
             }),
             vec![0x58, 0x01, 0xff, 0x06, 0x08, 0x14, 0x0a, 0x0d, 0x0a, 0x0f]
         );
+    }
+
+    fn v1_anc_set(mode: AncMode, voice: bool, level: usize) -> Vec<u8> {
+        v1_payload(Command::AncSet {
+            dragging_ambient_sound_slider: false,
+            mode,
+            ambient_sound_voice_passthrough: voice,
+            ambient_sound_level: level,
+        })
+    }
+
+    #[test]
+    fn v1_set_ambient_off() {
+        // 68:02:00:02:00:01:00:00  (OFF, focus=false, level=0)
+        assert_eq!(v1_anc_set(AncMode::Off, false, 0), vec![0x68, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00]);
+        // 68:02:00:02:00:01:01:0A  (OFF, focus=true, level=10)
+        assert_eq!(v1_anc_set(AncMode::Off, true, 10), vec![0x68, 0x02, 0x00, 0x02, 0x00, 0x01, 0x01, 0x0a]);
+    }
+
+    #[test]
+    fn v1_set_ambient_sound() {
+        // 68:02:11:02:00:01:00:0A  (AMBIENT, focus=false, level=10)
+        assert_eq!(v1_anc_set(AncMode::AmbientSound, false, 10), vec![0x68, 0x02, 0x11, 0x02, 0x00, 0x01, 0x00, 0x0a]);
+        // 68:02:11:02:00:01:01:0F  (AMBIENT, focus=true, level=15)
+        assert_eq!(v1_anc_set(AncMode::AmbientSound, true, 15), vec![0x68, 0x02, 0x11, 0x02, 0x00, 0x01, 0x01, 0x0f]);
+    }
+
+    #[test]
+    fn v1_set_noise_cancelling() {
+        // 68:02:11:02:02:01:00:00  (NC, focus=false, level=0)
+        assert_eq!(v1_anc_set(AncMode::ActiveNoiseCanceling, false, 0), vec![0x68, 0x02, 0x11, 0x02, 0x02, 0x01, 0x00, 0x00]);
+        // 68:02:11:02:02:01:01:00  (NC, focus=true, level=15 -> level byte forced to 0)
+        assert_eq!(v1_anc_set(AncMode::ActiveNoiseCanceling, true, 15), vec![0x68, 0x02, 0x11, 0x02, 0x02, 0x01, 0x01, 0x00]);
     }
 
     #[test]
