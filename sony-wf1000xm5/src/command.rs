@@ -11,6 +11,8 @@ pub enum CommandError {
         "equalizer preset {preset:?} does not support custom settings (use Manual, Custom1, or Custom2)"
     )]
     EqualizerPresetNotCustomizable { preset: EqualizerPreset },
+    #[error("command not supported on protocol {version:?}")]
+    UnsupportedForVersion { version: ProtocolVersion },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,15 +297,25 @@ impl Command {
                 ProtocolVersion::V1 => vec![0x18, 0x00],
             },
 
-            Self::SoundPressureMeasure { on } => {
-                // from HCI logs start: 3e0e0000000004580301006e3c
-                // from HCI logs stop: 3e0e0000000004580301016f3c
-                vec![0x58, 0x03, 0x01, if *on { 0x00 } else { 0x01 }]
-            }
-            Self::GetSoundPressure => {
-                // from HCI logs: 3e0e01000000025a036e3c
-                vec![0x5a, 0x03]
-            }
+            Self::SoundPressureMeasure { on } => match version {
+                ProtocolVersion::V2 => {
+                    // from HCI logs start: 3e0e0000000004580301006e3c
+                    // from HCI logs stop:  3e0e0000000004580301016f3c
+                    vec![0x58, 0x03, 0x01, if *on { 0x00 } else { 0x01 }]
+                }
+                ProtocolVersion::V1 => {
+                    return Err(CommandError::UnsupportedForVersion { version });
+                }
+            },
+            Self::GetSoundPressure => match version {
+                ProtocolVersion::V2 => {
+                    // from HCI logs: 3e0e01000000025a036e3c
+                    vec![0x5a, 0x03]
+                }
+                ProtocolVersion::V1 => {
+                    return Err(CommandError::UnsupportedForVersion { version });
+                }
+            },
         })
     }
 }
@@ -492,6 +504,20 @@ mod test {
         assert_eq!(v1_anc_set(AncMode::ActiveNoiseCanceling, false, 0), vec![0x68, 0x02, 0x11, 0x02, 0x02, 0x01, 0x00, 0x00]);
         // 68:02:11:02:02:01:01:00  (NC, focus=true, level=15 -> level byte forced to 0)
         assert_eq!(v1_anc_set(AncMode::ActiveNoiseCanceling, true, 15), vec![0x68, 0x02, 0x11, 0x02, 0x02, 0x01, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn v1_sound_pressure_unsupported() {
+        assert!(matches!(
+            build_command(&Command::GetSoundPressure, 0, ProtocolVersion::V1),
+            Err(CommandError::UnsupportedForVersion { version: ProtocolVersion::V1 })
+        ));
+        assert!(matches!(
+            build_command(&Command::SoundPressureMeasure { on: true }, 0, ProtocolVersion::V1),
+            Err(CommandError::UnsupportedForVersion { version: ProtocolVersion::V1 })
+        ));
+        // v2 still works
+        assert!(build_command(&Command::GetSoundPressure, 0, ProtocolVersion::V2).is_ok());
     }
 
     #[test]
