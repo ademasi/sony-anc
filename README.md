@@ -3,6 +3,15 @@
 A tiny Rust CLI to flip the ANC mode of Sony WF-1000XM5 earbuds and surface the state to Waybar.  
 All low-level protocol code is reused from [`usering-around/sony-wf1000xm5-controller`](https://github.com/usering-around/sony-wf1000xm5-controller); this project only strips the GUI away and exposes a JSON-friendly interface for bars/scripts.
 
+## Supported devices
+
+- **WF-1000XM5** (Sony protocol v2) — full support.
+- **WF-1000XM3** (Sony protocol v1) — ANC/ambient, battery, codec, and equalizer.
+  Sound-pressure readout is XM5-only.
+
+The protocol version is auto-detected from the device's init reply. Override it
+with `--model xm3|xm5` or the `SONY_WF1000XM5_MODEL=xm3|xm5` environment variable.
+
 ## Build & install
 
 ```bash
@@ -33,6 +42,9 @@ sony-anc pressure
 
 # nudge a single EQ band (writes the Manual preset, keeps other bands)
 sony-anc equalizer set --bass 3
+
+# target an XM3 explicitly (auto-detected otherwise)
+sony-anc --model xm3 status
 ```
 
 Environment override: `SONY_WF1000XM5_DEVICE` can be set to a name substring or MAC to pick the device.
