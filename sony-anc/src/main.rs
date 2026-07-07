@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use sony_wf1000xm5::{
+    ProtocolVersion,
     command::{AncMode, BatteryType, Command, EqualizerPreset},
     frame_parser::{FrameParser, FrameParserResult},
     payload::{BatteryLevel, Payload, parse_payload},
@@ -29,6 +30,10 @@ struct Cli {
     /// Device name (substring) or MAC address to target. Defaults to the first WF-1000XM5.
     #[arg(short, long)]
     device: Option<String>,
+
+    /// Force the protocol model instead of auto-detecting (xm3 = v1, xm5 = v2).
+    #[arg(long, value_enum)]
+    model: Option<CliModel>,
 
     #[command(subcommand)]
     action: Option<Action>,
@@ -180,6 +185,34 @@ impl AncCliMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliModel {
+    Xm3,
+    Xm5,
+}
+
+impl From<CliModel> for ProtocolVersion {
+    fn from(m: CliModel) -> Self {
+        match m {
+            CliModel::Xm3 => ProtocolVersion::V1,
+            CliModel::Xm5 => ProtocolVersion::V2,
+        }
+    }
+}
+
+/// Parse the SONY_WF1000XM5_MODEL env override (xm3/xm5/v1/v2, case-insensitive).
+fn model_from_env() -> Option<ProtocolVersion> {
+    match std::env::var("SONY_WF1000XM5_MODEL")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "xm3" | "v1" => Some(ProtocolVersion::V1),
+        "xm5" | "v2" => Some(ProtocolVersion::V2),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct WaybarOutput {
     text: String,
@@ -200,6 +233,7 @@ struct SonyClient {
     frame_parser: FrameParser,
     seq_number: u8,
     waiting_for_ack: bool,
+    version: ProtocolVersion,
 }
 
 #[tokio::main]
@@ -223,12 +257,13 @@ async fn run() -> Result<()> {
         .device
         .or_else(|| std::env::var("SONY_WF1000XM5_DEVICE").ok());
     let action = cli.action.unwrap_or(Action::Status);
+    let version_override = cli.model.map(ProtocolVersion::from).or_else(model_from_env);
 
     if matches!(action, Action::Watch) {
-        return run_watch(&target).await;
+        return run_watch(&target, version_override).await;
     }
 
-    let mut client = match connect(&target).await? {
+    let mut client = match connect(&target, version_override).await? {
         Some(client) => client,
         None => {
             print_output(None);
@@ -486,7 +521,10 @@ fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
 
 /// Long-lived watch loop: hold one connection, stream ANC changes to stdout,
 /// react to SIGUSR1 (cycle next) / SIGUSR2 (cycle prev), and reconnect forever.
-async fn run_watch(target: &Option<String>) -> Result<()> {
+async fn run_watch(
+    target: &Option<String>,
+    version_override: Option<ProtocolVersion>,
+) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sig_next = signal(SignalKind::user_defined1())?;
@@ -501,7 +539,7 @@ async fn run_watch(target: &Option<String>) -> Result<()> {
     print_output(None);
 
     loop {
-        match connect(target).await {
+        match connect(target, version_override).await {
             Ok(Some(mut client)) => {
                 if let Ok(state) = client.fetch_anc_status().await {
                     current_level = state.ambient_level;
@@ -523,7 +561,10 @@ async fn run_watch(target: &Option<String>) -> Result<()> {
     }
 }
 
-async fn connect(device_hint: &Option<String>) -> Result<Option<SonyClient>> {
+async fn connect(
+    device_hint: &Option<String>,
+    version_override: Option<ProtocolVersion>,
+) -> Result<Option<SonyClient>> {
     let session = Session::new().await?;
     let adapter = match session.default_adapter().await {
         Ok(adapter) => adapter,
@@ -568,13 +609,22 @@ async fn connect(device_hint: &Option<String>) -> Result<Option<SonyClient>> {
         frame_parser: FrameParser::new(),
         seq_number: 0,
         waiting_for_ack: false,
+        version: version_override.unwrap_or(ProtocolVersion::V2),
     };
 
     client.send_command(Command::Init).await?;
-    client
-        .wait_for_payload(Duration::from_secs(3), |p| matches!(p, Payload::InitReply))
+    let reply = client
+        .wait_for_payload(Duration::from_secs(3), |p| {
+            matches!(p, Payload::InitReply { .. })
+        })
         .await?
         .ok_or_else(|| anyhow!("no init reply from device"))?;
+    // Honor an explicit override; otherwise adopt the version detected from the reply length.
+    if version_override.is_none()
+        && let Payload::InitReply { version } = reply
+    {
+        client.version = version;
+    }
 
     Ok(Some(client))
 }
@@ -584,7 +634,7 @@ impl SonyClient {
         if self.waiting_for_ack {
             return Err(anyhow!("still waiting for ack from previous command"));
         }
-        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number)
+        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number, self.version)
             .context("failed to build command")?;
         self.waiting_for_ack = !matches!(command, Command::Ack);
         self.stream
@@ -640,7 +690,7 @@ impl SonyClient {
                         if kind == sony_wf1000xm5::MessageType::Command1
                             || kind == sony_wf1000xm5::MessageType::Command2
                         {
-                            let payload = match parse_payload(msg.payload, kind) {
+                            let payload = match parse_payload(msg.payload, kind, self.version) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("bad payload: {e}");
@@ -649,9 +699,11 @@ impl SonyClient {
                             };
 
                             // respond with ACK
-                            if let Ok(ack) =
-                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                            {
+                            if let Ok(ack) = sony_wf1000xm5::command::build_command(
+                                &Command::Ack,
+                                msg.seq_num,
+                                self.version,
+                            ) {
                                 let _ = self.stream.write_all(&ack).await;
                             }
 
@@ -818,6 +870,9 @@ impl SonyClient {
     }
 
     async fn fetch_sound_pressure(&mut self) -> Result<usize> {
+        if self.version == ProtocolVersion::V1 {
+            return Err(anyhow!("sound pressure is not supported on the WF-1000XM3"));
+        }
         self.send_command(Command::SoundPressureMeasure { on: true })
             .await?;
         self.wait_for_payload(Duration::from_secs(2), |p| {
@@ -862,7 +917,7 @@ impl SonyClient {
                     if kind == sony_wf1000xm5::MessageType::Command1
                         || kind == sony_wf1000xm5::MessageType::Command2
                     {
-                        let payload = match parse_payload(msg.payload, kind) {
+                        let payload = match parse_payload(msg.payload, kind, self.version) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("bad payload: {e}");
@@ -870,9 +925,11 @@ impl SonyClient {
                             }
                         };
 
-                        if let Ok(ack) =
-                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                        {
+                        if let Ok(ack) = sony_wf1000xm5::command::build_command(
+                            &Command::Ack,
+                            msg.seq_num,
+                            self.version,
+                        ) {
                             let _ = self.stream.write_all(&ack).await;
                         }
 

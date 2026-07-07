@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    MessageType,
+    MessageType, ProtocolVersion,
     command::{AncMode, BatteryType, EqualizerPreset},
 };
 
@@ -21,30 +21,40 @@ pub enum PayloadType {
 }
 
 impl PayloadType {
-    pub fn from_byte(msg_type: MessageType, byte: u8) -> Option<Self> {
+    pub fn from_byte(msg_type: MessageType, byte: u8, version: ProtocolVersion) -> Option<Self> {
         Some(match msg_type {
             MessageType::Ack => return None,
-            MessageType::Command1 => match byte {
-                0x1 => Self::InitReply,
-                0x13 => Self::CodecGet,
-                0x15 => Self::CodecNotify,
-                0x23 => Self::BatteryLevel,
-                0x25 => Self::BatteryLevelNotify,
-                0x57 => Self::Equalizer,
-                0x59 => Self::EqualizerNotify,
-                0x67 => Self::AncStatus,
-                0x69 => Self::AncStatusNotify,
+            MessageType::Command1 => match version {
+                ProtocolVersion::V2 => match byte {
+                    0x1 => Self::InitReply,
+                    0x13 => Self::CodecGet,
+                    0x15 => Self::CodecNotify,
+                    0x23 => Self::BatteryLevel,
+                    0x25 => Self::BatteryLevelNotify,
+                    0x57 => Self::Equalizer,
+                    0x59 => Self::EqualizerNotify,
+                    0x67 => Self::AncStatus,
+                    0x69 => Self::AncStatusNotify,
+                    _ => return None,
+                },
+                ProtocolVersion::V1 => match byte {
+                    0x1 => Self::InitReply,
+                    0x19 => Self::CodecGet,
+                    0x1b => Self::CodecNotify,
+                    0x11 => Self::BatteryLevel,
+                    0x13 => Self::BatteryLevelNotify,
+                    0x57 => Self::Equalizer,
+                    0x59 => Self::EqualizerNotify,
+                    0x67 => Self::AncStatus,
+                    0x69 => Self::AncStatusNotify,
+                    _ => return None,
+                },
+            },
+            MessageType::Command2 => match byte {
+                0x59 => Self::SoundPressureMeasureReply,
+                0x5b => Self::PressureGet,
                 _ => return None,
             },
-            MessageType::Command2 => {
-                match byte {
-                    // from hci log: 3e0e0000000004590301006f3c
-                    0x59 => Self::SoundPressureMeasureReply,
-                    // from hci logs: 3e0e01000000045b034203b63c
-                    0x5b => Self::PressureGet,
-                    _ => return None,
-                }
-            }
         })
     }
 }
@@ -91,7 +101,9 @@ impl Codec {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Payload {
-    InitReply,
+    InitReply {
+        version: ProtocolVersion,
+    },
     BatteryLevel(BatteryLevel),
     Equalizer {
         preset: EqualizerPreset,
@@ -137,21 +149,30 @@ pub enum ParsePayloadError {
 pub fn parse_payload(
     payload: &[u8],
     message_type: MessageType,
+    version: ProtocolVersion,
 ) -> std::result::Result<Payload, ParsePayloadError> {
     if payload.is_empty() {
         return Err(ParsePayloadError::Empty);
     }
 
-    let payload_type = PayloadType::from_byte(message_type, payload[0])
+    let payload_type = PayloadType::from_byte(message_type, payload[0], version)
         .ok_or(ParsePayloadError::UnknownPayloadType { kind: payload[0] })?;
 
     Ok(match payload_type {
-        PayloadType::InitReply => Payload::InitReply,
+        PayloadType::InitReply => {
+            // v1 init reply is 4 bytes, v2 is 8. Detect regardless of the passed version.
+            let detected = if payload.len() == 4 {
+                ProtocolVersion::V1
+            } else {
+                ProtocolVersion::V2
+            };
+            Payload::InitReply { version: detected }
+        }
         PayloadType::BatteryLevel | PayloadType::BatteryLevelNotify => {
             if payload.len() < 5 {
                 return Err(ParsePayloadError::PayloadTooSmall { payload_type });
             }
-            let battery_type = BatteryType::from_byte(payload[1]).ok_or(
+            let battery_type = BatteryType::from_byte(payload[1], version).ok_or(
                 ParsePayloadError::UnknownBatteryType {
                     battery: payload[1],
                 },
@@ -188,27 +209,52 @@ pub fn parse_payload(
             }
         }
 
-        PayloadType::AncStatus | PayloadType::AncStatusNotify => {
-            if payload.len() < 7 {
-                return Err(ParsePayloadError::PayloadTooSmall { payload_type });
+        PayloadType::AncStatus | PayloadType::AncStatusNotify => match version {
+            ProtocolVersion::V2 => {
+                if payload.len() < 7 {
+                    return Err(ParsePayloadError::PayloadTooSmall { payload_type });
+                }
+                let mode = if payload[3] == 0 {
+                    AncMode::Off
+                } else if payload[4] == 0 {
+                    AncMode::ActiveNoiseCanceling
+                } else {
+                    AncMode::AmbientSound
+                };
+                Payload::AncStatus {
+                    mode,
+                    ambient_sound_voice_passthrough: payload[5] == 1,
+                    ambient_sound_level: payload[6],
+                }
             }
-            let mode = if payload[3] == 0 {
-                AncMode::Off
-            } else if payload[4] == 0 {
-                AncMode::ActiveNoiseCanceling
-            } else {
-                AncMode::AmbientSound
-            };
-            let ambient_sound_voice_passthrough = payload[5] == 1;
-
-            let ambient_sound_level = payload[6];
-
-            Payload::AncStatus {
-                mode,
-                ambient_sound_voice_passthrough,
-                ambient_sound_level,
+            ProtocolVersion::V1 => {
+                if payload.len() < 8 {
+                    return Err(ParsePayloadError::PayloadTooSmall { payload_type });
+                }
+                // payload[2]: 0x00 = off, 0x01 = enabled
+                // payload[3]: 0x02 = wind-capable, 0x00 = not
+                // payload[4]: mode detail (wind-capable: 0=ambient,1=wind,2=nc)
+                let mode = if payload[2] == 0 {
+                    AncMode::Off
+                } else if payload[3] == 0x02 {
+                    match payload[4] {
+                        0 => AncMode::AmbientSound,
+                        1 => AncMode::AmbientSound, // wind -> displayed as ambient
+                        _ => AncMode::ActiveNoiseCanceling,
+                    }
+                } else {
+                    match payload[4] {
+                        0 => AncMode::AmbientSound,
+                        _ => AncMode::ActiveNoiseCanceling,
+                    }
+                };
+                Payload::AncStatus {
+                    mode,
+                    ambient_sound_voice_passthrough: payload[6] == 1,
+                    ambient_sound_level: payload[7],
+                }
             }
-        }
+        },
 
         PayloadType::CodecGet | PayloadType::CodecNotify => {
             if payload.len() < 3 {
@@ -263,7 +309,7 @@ mod test {
                     msg.checksum
                 );
                 let kind = msg.kind.expect("known message type");
-                parse_payload(msg.payload, kind).expect("payload parses")
+                parse_payload(msg.payload, kind, ProtocolVersion::V2).expect("payload parses")
             }
             other => panic!(
                 "frame did not complete: {:?}",
@@ -307,10 +353,21 @@ mod test {
 
     #[test]
     fn init_reply() {
-        let payload = [0x01];
+        // 8-byte payload -> v2 (detection ignores the passed version)
+        let payload = [0x01, 0, 0x03, 0, 0, 0, 0, 0];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
-            Payload::InitReply
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
+            Payload::InitReply {
+                version: ProtocolVersion::V2
+            }
+        );
+        // 4-byte payload -> v1, even when V2 is passed in
+        let v1_payload = [0x01, 0x00, 0x40, 0x10];
+        assert_eq!(
+            parse_payload(&v1_payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
+            Payload::InitReply {
+                version: ProtocolVersion::V1
+            }
         );
     }
 
@@ -319,7 +376,7 @@ mod test {
         // [type=0x23, battery=0x0a (case), value=75, _, _]
         let payload = [0x23, 0x0a, 75, 0x00, 0x00];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::BatteryLevel(BatteryLevel::Case(75))
         );
     }
@@ -329,7 +386,7 @@ mod test {
         // left = byte[2], right = byte[4]; byte[3] is intentionally skipped
         let payload = [0x23, 0x01, 80, 0x00, 85];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::BatteryLevel(BatteryLevel::Headphones {
                 left: 80,
                 right: 85
@@ -342,7 +399,7 @@ mod test {
         // preset byte[2]=0x10 (Bright); bands at byte[4..10] are stored +10
         let payload = [0x57, 0x00, 0x10, 0x06, 12, 10, 10, 10, 10, 7];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::Equalizer {
                 preset: EqualizerPreset::Bright,
                 clear_bass: 2,
@@ -360,7 +417,7 @@ mod test {
         // byte[3]==0 -> Off
         let payload = [0x67, 0, 0, 0, 0, 0, 0];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::AncStatus {
                 mode: AncMode::Off,
                 ambient_sound_voice_passthrough: false,
@@ -374,7 +431,7 @@ mod test {
         // byte[3]!=0 && byte[4]==0 -> ANC
         let payload = [0x67, 0, 0, 1, 0, 0, 0];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::AncStatus {
                 mode: AncMode::ActiveNoiseCanceling,
                 ambient_sound_voice_passthrough: false,
@@ -388,7 +445,7 @@ mod test {
         // byte[3]!=0 && byte[4]!=0 -> Ambient; voice=byte[5]==1; level=byte[6]
         let payload = [0x67, 0, 0, 1, 1, 1, 10];
         assert_eq!(
-            parse_payload(&payload, MessageType::Command1).unwrap(),
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
             Payload::AncStatus {
                 mode: AncMode::AmbientSound,
                 ambient_sound_voice_passthrough: true,
@@ -409,7 +466,7 @@ mod test {
         ] {
             let payload = [0x13, 0x00, byte];
             assert_eq!(
-                parse_payload(&payload, MessageType::Command1).unwrap(),
+                parse_payload(&payload, MessageType::Command1, ProtocolVersion::V2).unwrap(),
                 Payload::Codec { codec: expected }
             );
         }
@@ -418,7 +475,7 @@ mod test {
     #[test]
     fn empty_payload_errors() {
         assert!(matches!(
-            parse_payload(&[], MessageType::Command1),
+            parse_payload(&[], MessageType::Command1, ProtocolVersion::V2),
             Err(ParsePayloadError::Empty)
         ));
     }
@@ -426,7 +483,7 @@ mod test {
     #[test]
     fn unknown_payload_type_errors() {
         assert!(matches!(
-            parse_payload(&[0xff], MessageType::Command1),
+            parse_payload(&[0xff], MessageType::Command1, ProtocolVersion::V2),
             Err(ParsePayloadError::UnknownPayloadType { kind: 0xff })
         ));
     }
@@ -435,7 +492,7 @@ mod test {
     fn battery_too_small_errors() {
         // BatteryLevel needs >= 5 bytes
         assert!(matches!(
-            parse_payload(&[0x23, 0x01], MessageType::Command1),
+            parse_payload(&[0x23, 0x01], MessageType::Command1, ProtocolVersion::V2),
             Err(ParsePayloadError::PayloadTooSmall { .. })
         ));
     }
@@ -444,7 +501,11 @@ mod test {
     fn unknown_battery_type_errors() {
         // 0x05 is not a known battery type
         assert!(matches!(
-            parse_payload(&[0x23, 0x05, 0, 0, 0], MessageType::Command1),
+            parse_payload(
+                &[0x23, 0x05, 0, 0, 0],
+                MessageType::Command1,
+                ProtocolVersion::V2
+            ),
             Err(ParsePayloadError::UnknownBatteryType { battery: 0x05 })
         ));
     }
@@ -452,7 +513,11 @@ mod test {
     #[test]
     fn unknown_codec_errors() {
         assert!(matches!(
-            parse_payload(&[0x13, 0x00, 0x99], MessageType::Command1),
+            parse_payload(
+                &[0x13, 0x00, 0x99],
+                MessageType::Command1,
+                ProtocolVersion::V2
+            ),
             Err(ParsePayloadError::UnknownCodec { codec: 0x99 })
         ));
     }
@@ -462,9 +527,87 @@ mod test {
         assert!(matches!(
             parse_payload(
                 &[0x57, 0x00, 0x99, 0x06, 10, 10, 10, 10, 10, 10],
-                MessageType::Command1
+                MessageType::Command1,
+                ProtocolVersion::V2
             ),
             Err(ParsePayloadError::UnknownEqualizerPreset { preset: 0x99 })
         ));
+    }
+
+    #[test]
+    fn v1_anc_status_off() {
+        // [type=0x67, _, 0x00(off), wind=0x02, detail, _, focus, level]
+        let payload = [0x67, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::Off,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn v1_anc_status_ambient_and_nc_and_wind() {
+        // enabled(0x01), wind-capable(0x03=0x02), detail=0 -> ambient; focus at [6], level at [7]
+        let ambient = [0x67, 0x00, 0x01, 0x02, 0x00, 0x01, 0x01, 0x0a];
+        assert_eq!(
+            parse_payload(&ambient, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::AmbientSound,
+                ambient_sound_voice_passthrough: true,
+                ambient_sound_level: 10
+            }
+        );
+        // detail=2 -> noise cancelling
+        let nc = [0x67, 0x00, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&nc, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::ActiveNoiseCanceling,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0
+            }
+        );
+        // detail=1 (wind) -> mapped to AmbientSound for the 3-mode CLI
+        let wind = [0x67, 0x00, 0x01, 0x02, 0x01, 0x01, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&wind, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::AncStatus {
+                mode: AncMode::AmbientSound,
+                ambient_sound_voice_passthrough: false,
+                ambient_sound_level: 0
+            }
+        );
+    }
+
+    #[test]
+    fn v1_battery_dual_and_case() {
+        // v1 dual: type byte 0x01, left=payload[2], right=payload[4]
+        let dual = [0x11, 0x01, 80, 0x00, 85];
+        assert_eq!(
+            parse_payload(&dual, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Headphones {
+                left: 80,
+                right: 85
+            })
+        );
+        // v1 case: type byte 0x02
+        let case = [0x11, 0x02, 60, 0x00, 0x00];
+        assert_eq!(
+            parse_payload(&case, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Case(60))
+        );
+    }
+
+    #[test]
+    fn v1_codec_via_notify_byte() {
+        // v1 codec notify type byte is 0x1b, value at payload[2]
+        let payload = [0x1b, 0x00, 0x10];
+        assert_eq!(
+            parse_payload(&payload, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::Codec { codec: Codec::Ldac }
+        );
     }
 }

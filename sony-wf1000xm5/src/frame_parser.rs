@@ -155,7 +155,7 @@ impl Default for FrameParser {
 #[cfg(test)]
 mod test {
     use crate::{
-        MESSAGE_HEADER, MESSAGE_TRAILER,
+        MESSAGE_HEADER, MESSAGE_TRAILER, ProtocolVersion,
         command::{AncMode, build_command},
     };
 
@@ -163,13 +163,24 @@ mod test {
     #[test]
     fn basic_messages() {
         let good_messages = vec![
-            build_command(&crate::command::Command::GetAncStatus, 0).unwrap(),
-            build_command(&crate::command::Command::GetEqualizerSettings, 0x69).unwrap(),
+            build_command(
+                &crate::command::Command::GetAncStatus,
+                0,
+                ProtocolVersion::V2,
+            )
+            .unwrap(),
+            build_command(
+                &crate::command::Command::GetEqualizerSettings,
+                0x69,
+                ProtocolVersion::V2,
+            )
+            .unwrap(),
             build_command(
                 &crate::command::Command::GetBatteryStatus {
                     battery_type: crate::command::BatteryType::Headphones,
                 },
                 0x22,
+                ProtocolVersion::V2,
             )
             .unwrap(),
             build_command(
@@ -180,6 +191,7 @@ mod test {
                     ambient_sound_level: 15,
                 },
                 0xe,
+                ProtocolVersion::V2,
             )
             .unwrap(),
         ];
