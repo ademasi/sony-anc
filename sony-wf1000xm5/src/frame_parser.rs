@@ -163,8 +163,12 @@ mod test {
     #[test]
     fn basic_messages() {
         let good_messages = vec![
-            build_command(&crate::command::Command::GetAncStatus, 0, ProtocolVersion::V2)
-                .unwrap(),
+            build_command(
+                &crate::command::Command::GetAncStatus,
+                0,
+                ProtocolVersion::V2,
+            )
+            .unwrap(),
             build_command(
                 &crate::command::Command::GetEqualizerSettings,
                 0x69,

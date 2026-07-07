@@ -588,7 +588,10 @@ mod test {
         let dual = [0x11, 0x01, 80, 0x00, 85];
         assert_eq!(
             parse_payload(&dual, MessageType::Command1, ProtocolVersion::V1).unwrap(),
-            Payload::BatteryLevel(BatteryLevel::Headphones { left: 80, right: 85 })
+            Payload::BatteryLevel(BatteryLevel::Headphones {
+                left: 80,
+                right: 85
+            })
         );
         // v1 case: type byte 0x02
         let case = [0x11, 0x02, 60, 0x00, 0x00];
