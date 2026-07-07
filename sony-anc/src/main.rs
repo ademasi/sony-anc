@@ -575,7 +575,9 @@ async fn connect(device_hint: &Option<String>) -> Result<Option<SonyClient>> {
 
     client.send_command(Command::Init).await?;
     client
-        .wait_for_payload(Duration::from_secs(3), |p| matches!(p, Payload::InitReply))
+        .wait_for_payload(Duration::from_secs(3), |p| {
+            matches!(p, Payload::InitReply { .. })
+        })
         .await?
         .ok_or_else(|| anyhow!("no init reply from device"))?;
 
@@ -643,7 +645,7 @@ impl SonyClient {
                         if kind == sony_wf1000xm5::MessageType::Command1
                             || kind == sony_wf1000xm5::MessageType::Command2
                         {
-                            let payload = match parse_payload(msg.payload, kind) {
+                            let payload = match parse_payload(msg.payload, kind, self.version) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("bad payload: {e}");
@@ -867,7 +869,7 @@ impl SonyClient {
                     if kind == sony_wf1000xm5::MessageType::Command1
                         || kind == sony_wf1000xm5::MessageType::Command2
                     {
-                        let payload = match parse_payload(msg.payload, kind) {
+                        let payload = match parse_payload(msg.payload, kind, self.version) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("bad payload: {e}");
