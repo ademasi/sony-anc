@@ -71,11 +71,18 @@ pub enum BatteryType {
 }
 
 impl BatteryType {
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        Some(match byte {
-            0x1 | 0x9 => Self::Headphones,
-            0xa => Self::Case,
-            _ => return None,
+    pub fn from_byte(byte: u8, version: ProtocolVersion) -> Option<Self> {
+        Some(match version {
+            ProtocolVersion::V2 => match byte {
+                0x1 | 0x9 => Self::Headphones,
+                0xa => Self::Case,
+                _ => return None,
+            },
+            ProtocolVersion::V1 => match byte {
+                0x1 => Self::Headphones, // DUAL
+                0x0 | 0x2 => Self::Case, // SINGLE / CASE
+                _ => return None,
+            },
         })
     }
 
