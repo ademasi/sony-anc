@@ -92,6 +92,43 @@ disconnect, `watch` emits the `disconnected` class and reconnects automatically.
 > A systemd `--user` unit is intentionally **not** provided for `watch`: Waybar must
 > own the process so it can read the streamed stdout.
 
+#### Multiple monitors
+
+Waybar draws its bar (and runs each `exec`) once per output. The buds accept only
+**one** app connection, so the config above would start one `watch` daemon per
+monitor and they would fight over the connection. Instead, run a single shared
+daemon and have every bar tail its output. Save this as
+`~/.config/waybar/scripts/sony-anc-stream.sh` (`chmod +x`):
+
+```sh
+#!/bin/sh
+runtime="${XDG_RUNTIME_DIR:-/tmp}"
+state="$runtime/sony-anc.json"
+lock="$runtime/sony-anc-watch.lock"
+bin="$HOME/.local/bin/sony-anc"
+
+[ -f "$state" ] || printf '%s\n' '{"text":"","class":"disconnected"}' >"$state"
+
+# Start the shared daemon iff the lock is free. It inherits fd 9 and holds the
+# flock for its lifetime, so a second bar's non-blocking flock fails and it just
+# tails instead.
+if flock -n 9; then
+	setsid "$bin" watch >"$state" 2>"$runtime/sony-anc-watch.log" &
+fi 9>"$lock"
+
+exec tail -n1 -F "$state"
+```
+
+Then point the module's `exec` at the script (keep the same `on-click`/`on-scroll`
+signal handlers, which still target the single daemon):
+
+```jsonc
+"exec": "$HOME/.config/waybar/scripts/sony-anc-stream.sh",
+```
+
+Single-monitor setups can use the plain `exec` form above; this wrapper is only
+needed when the bar spans more than one output.
+
 ## Notes on protocol
 
 The binary links against the `sony-wf1000xm5` crate in this repo, which is a direct copy of the upstream protocol library from `usering-around/sony-wf1000xm5-controller`. The RFCOMM UUID, frame parser, and ANC command payloads come from that source; only the surrounding CLI/Waybar glue was added here.

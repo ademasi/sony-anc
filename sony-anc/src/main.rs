@@ -15,8 +15,11 @@ use sony_wf1000xm5::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 
-const DEFAULT_DEVICE_NAME: &str = "WF-1000XM5";
-const SONY_SERVICE_UUID: Uuid = Uuid::from_u128(0x956C7B26_D49A_4BA8_B03F_B17D393CB6E2);
+const DEFAULT_DEVICE_NAME: &str = "WF-1000XM";
+// Sony's RFCOMM service UUIDs. Older protocol-v1 devices (e.g. WF-1000XM3) advertise
+// the V1 UUID; newer v2 devices (e.g. WF-1000XM5) advertise the V2 UUID.
+const SONY_SERVICE_UUID_V1: Uuid = Uuid::from_u128(0x96CC203E_5068_46AD_B32D_E316F5E069BA);
+const SONY_SERVICE_UUID_V2: Uuid = Uuid::from_u128(0x956C7B26_D49A_4BA8_B03F_B17D393CB6E2);
 const DEFAULT_AMBIENT_LEVEL: u8 = 10;
 
 #[derive(Debug, Parser)]
@@ -579,8 +582,20 @@ async fn connect(
         return Ok(None);
     }
 
+    // Pick the Sony RFCOMM service UUID the device actually advertises: v1 devices
+    // (WF-1000XM3) and v2 devices (WF-1000XM5) use different UUIDs. Prefer v2, fall
+    // back to v1, then default to v2.
+    let advertised = device.uuids().await.ok().flatten().unwrap_or_default();
+    let service_uuid = if advertised.contains(&SONY_SERVICE_UUID_V2) {
+        SONY_SERVICE_UUID_V2
+    } else if advertised.contains(&SONY_SERVICE_UUID_V1) {
+        SONY_SERVICE_UUID_V1
+    } else {
+        SONY_SERVICE_UUID_V2
+    };
+
     let profile = Profile {
-        uuid: SONY_SERVICE_UUID,
+        uuid: service_uuid,
         role: Some(Role::Client),
         auto_connect: Some(true),
         ..Default::default()
@@ -977,16 +992,22 @@ impl SonyClient {
                 }
                 _ = sig_next.recv() => {
                     let next = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
-                    if let Ok(state) = self.set_mode(next, *current_level, None, None).await {
-                        *current_level = state.ambient_level;
-                        emit_anc_if_changed(last, Some(&state));
+                    match self.set_mode(next, *current_level, None, None).await {
+                        Ok(state) => {
+                            *current_level = state.ambient_level;
+                            emit_anc_if_changed(last, Some(&state));
+                        }
+                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
                 }
                 _ = sig_prev.recv() => {
                     let prev = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
-                    if let Ok(state) = self.set_mode(prev, *current_level, None, None).await {
-                        *current_level = state.ambient_level;
-                        emit_anc_if_changed(last, Some(&state));
+                    match self.set_mode(prev, *current_level, None, None).await {
+                        Ok(state) => {
+                            *current_level = state.ambient_level;
+                            emit_anc_if_changed(last, Some(&state));
+                        }
+                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
                 }
             }
