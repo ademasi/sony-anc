@@ -169,7 +169,8 @@ pub fn parse_payload(
             Payload::InitReply { version: detected }
         }
         PayloadType::BatteryLevel | PayloadType::BatteryLevelNotify => {
-            if payload.len() < 5 {
+            // Need the payload-type + battery-type bytes plus at least one value.
+            if payload.len() < 3 {
                 return Err(ParsePayloadError::PayloadTooSmall { payload_type });
             }
             let battery_type = BatteryType::from_byte(payload[1], version).ok_or(
@@ -178,12 +179,20 @@ pub fn parse_payload(
                 },
             )?;
             match battery_type {
+                // The case reports a single value at payload[2]. On v1 this reply is
+                // only 4 bytes, so it must not require the 5-byte headphones length.
                 BatteryType::Case => Payload::BatteryLevel(BatteryLevel::Case(payload[2] as usize)),
 
-                BatteryType::Headphones => Payload::BatteryLevel(BatteryLevel::Headphones {
-                    left: payload[2] as usize,
-                    right: payload[4] as usize,
-                }),
+                // Headphones report left at [2] and right at [4].
+                BatteryType::Headphones => {
+                    if payload.len() < 5 {
+                        return Err(ParsePayloadError::PayloadTooSmall { payload_type });
+                    }
+                    Payload::BatteryLevel(BatteryLevel::Headphones {
+                        left: payload[2] as usize,
+                        right: payload[4] as usize,
+                    })
+                }
             }
         }
 
@@ -598,6 +607,25 @@ mod test {
         assert_eq!(
             parse_payload(&case, MessageType::Command1, ProtocolVersion::V1).unwrap(),
             Payload::BatteryLevel(BatteryLevel::Case(60))
+        );
+    }
+
+    #[test]
+    fn v1_battery_real_hardware_bytes() {
+        // Captured from a real WF-1000XM3: dual reply is 6 bytes, case reply is 4.
+        let dual = [0x11, 0x01, 0x46, 0x00, 0x46, 0x00];
+        assert_eq!(
+            parse_payload(&dual, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Headphones {
+                left: 0x46,
+                right: 0x46
+            })
+        );
+        // The 4-byte case reply must parse (regression: the old >=5 check rejected it).
+        let case = [0x11, 0x02, 0x1e, 0x00];
+        assert_eq!(
+            parse_payload(&case, MessageType::Command1, ProtocolVersion::V1).unwrap(),
+            Payload::BatteryLevel(BatteryLevel::Case(0x1e))
         );
     }
 
