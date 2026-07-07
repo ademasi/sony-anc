@@ -49,6 +49,10 @@ impl EqualizerPreset {
             0xa0 => Self::Manual,
             0xa1 => Self::Custom1,
             0xa2 => Self::Custom2,
+            // v1 writes 0xff as the "custom bands" marker; if the device echoes it
+            // back on an equalizer read, treat it as the Manual (custom) preset
+            // rather than failing to parse. (v2 never emits 0xff.)
+            0xff => Self::Manual,
             _ => return None,
         })
     }
@@ -83,7 +87,10 @@ impl BatteryType {
             },
             ProtocolVersion::V1 => match byte {
                 0x1 => Self::Headphones, // DUAL
-                0x0 | 0x2 => Self::Case, // SINGLE / CASE
+                // CASE (0x02) is the charging case. SINGLE (0x00) is a
+                // single-battery report; the XM3 only ever requests DUAL+CASE, so
+                // 0x00 is a dormant fallback mapped to Case (never hit in practice).
+                0x0 | 0x2 => Self::Case,
                 _ => return None,
             },
         })
@@ -547,6 +554,15 @@ mod test {
         assert_eq!(
             v1_anc_set(AncMode::ActiveNoiseCanceling, true, 15),
             vec![0x68, 0x02, 0x11, 0x02, 0x02, 0x01, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn equalizer_custom_marker_parses_as_manual() {
+        // v1 echoes the 0xff custom-bands marker back on an equalizer read.
+        assert_eq!(
+            EqualizerPreset::from_byte(0xff),
+            Some(EqualizerPreset::Manual)
         );
     }
 
