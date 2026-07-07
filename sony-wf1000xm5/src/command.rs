@@ -1,4 +1,4 @@
-use crate::{ESCAPE_BYTE, ESCAPE_MASK, MESSAGE_HEADER, MESSAGE_TRAILER, MessageType, checksum};
+use crate::{ESCAPE_BYTE, ESCAPE_MASK, MESSAGE_HEADER, MESSAGE_TRAILER, MessageType, ProtocolVersion, checksum};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -76,6 +76,19 @@ impl BatteryType {
             _ => return None,
         })
     }
+
+    /// Wire byte for a battery-status request, which differs between protocol versions.
+    pub fn to_byte(self, version: ProtocolVersion) -> u8 {
+        match version {
+            // v2 discriminants: Headphones = 0x1, Case = 0xa
+            ProtocolVersion::V2 => self as u8,
+            // v1 codes: DUAL = 0x01, CASE = 0x02
+            ProtocolVersion::V1 => match self {
+                BatteryType::Headphones => 0x01,
+                BatteryType::Case => 0x02,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,7 +135,7 @@ impl Command {
     const GET_BATTERY_STATUS: u8 = 0x22;
     const EQUALIZER_GET: u8 = 0x56;
     const CODEC_GET: u8 = 0x12;
-    fn to_bytes(&self) -> Result<Vec<u8>, CommandError> {
+    fn to_bytes(&self, version: ProtocolVersion) -> Result<Vec<u8>, CommandError> {
         Ok(match self {
             Self::Init => {
                 vec![0, 0]
@@ -169,12 +182,19 @@ impl Command {
                 out
             }
 
-            Self::GetAncStatus => {
-                vec![Self::ANC_STATUS_GET, Self::SUPPORTS_AMBIENT_SOUND_CONTROL_2]
-            }
+            Self::GetAncStatus => match version {
+                ProtocolVersion::V2 => {
+                    vec![Self::ANC_STATUS_GET, Self::SUPPORTS_AMBIENT_SOUND_CONTROL_2]
+                }
+                ProtocolVersion::V1 => vec![Self::ANC_STATUS_GET, 0x02],
+            },
 
             Self::ChangeEqualizerPreset { preset } => {
-                vec![Self::EQUALIZER_SET, 0, *preset as u8, 0]
+                let sub_flag = match version {
+                    ProtocolVersion::V2 => 0,
+                    ProtocolVersion::V1 => 1,
+                };
+                vec![Self::EQUALIZER_SET, sub_flag, *preset as u8, 0]
             }
             Self::ChangeEqualizerSetting {
                 preset,
@@ -205,31 +225,55 @@ impl Command {
                 }
 
                 let data_size = 6; // bass level + 5 bands
-                vec![
-                    Self::EQUALIZER_SET,
-                    0,
-                    *preset as u8,
-                    data_size,
-                    (bass_level + 10) as u8,
-                    (band_400 + 10) as u8,
-                    (band_1000 + 10) as u8,
-                    (band_2500 + 10) as u8,
-                    (band_6300 + 10) as u8,
-                    (band_16000 + 10) as u8,
-                ]
+                match version {
+                    ProtocolVersion::V2 => vec![
+                        Self::EQUALIZER_SET,
+                        0,
+                        *preset as u8,
+                        data_size,
+                        (bass_level + 10) as u8,
+                        (band_400 + 10) as u8,
+                        (band_1000 + 10) as u8,
+                        (band_2500 + 10) as u8,
+                        (band_6300 + 10) as u8,
+                        (band_16000 + 10) as u8,
+                    ],
+                    // v1 always writes the 0xff "custom" marker instead of the preset code.
+                    ProtocolVersion::V1 => vec![
+                        Self::EQUALIZER_SET,
+                        1,
+                        0xff,
+                        data_size,
+                        (bass_level + 10) as u8,
+                        (band_400 + 10) as u8,
+                        (band_1000 + 10) as u8,
+                        (band_2500 + 10) as u8,
+                        (band_6300 + 10) as u8,
+                        (band_16000 + 10) as u8,
+                    ],
+                }
             }
 
             Self::GetBatteryStatus { battery_type } => {
-                vec![Self::GET_BATTERY_STATUS, *battery_type as u8]
+                let cmd_byte = match version {
+                    ProtocolVersion::V2 => Self::GET_BATTERY_STATUS,
+                    ProtocolVersion::V1 => 0x10,
+                };
+                vec![cmd_byte, battery_type.to_byte(version)]
             }
 
             Self::GetEqualizerSettings => {
-                vec![Self::EQUALIZER_GET, 0]
+                let sub_flag = match version {
+                    ProtocolVersion::V2 => 0,
+                    ProtocolVersion::V1 => 1,
+                };
+                vec![Self::EQUALIZER_GET, sub_flag]
             }
 
-            Self::GetCodec => {
-                vec![Self::CODEC_GET, 2]
-            }
+            Self::GetCodec => match version {
+                ProtocolVersion::V2 => vec![Self::CODEC_GET, 2],
+                ProtocolVersion::V1 => vec![0x18, 0x00],
+            },
 
             Self::SoundPressureMeasure { on } => {
                 // from HCI logs start: 3e0e0000000004580301006e3c
@@ -269,8 +313,12 @@ fn push_escaped(vec: &mut Vec<u8>, byte: u8) {
  * following byte masked with MESSAGE_ESCAPE_MASK.
  */
 /// Build a command to send the headphones
-pub fn build_command(command: &Command, seq_number: u8) -> Result<Vec<u8>, CommandError> {
-    let cmd = command.to_bytes()?;
+pub fn build_command(
+    command: &Command,
+    seq_number: u8,
+    version: ProtocolVersion,
+) -> Result<Vec<u8>, CommandError> {
+    let cmd = command.to_bytes(version)?;
     let mut buf = Vec::with_capacity(cmd.len() + 7);
     let message_type = match command {
         Command::AncSet { .. }
@@ -310,13 +358,98 @@ pub fn build_command(command: &Command, seq_number: u8) -> Result<Vec<u8>, Comma
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::ProtocolVersion;
+    use crate::frame_parser::{FrameParser, FrameParserResult};
+
+    /// Build a command as v1 and recover its (unescaped) payload bytes for
+    /// comparison against Gadgetbridge's golden request vectors.
+    fn v1_payload(cmd: Command) -> Vec<u8> {
+        let frame = build_command(&cmd, 0, ProtocolVersion::V1).unwrap();
+        let mut parser = FrameParser::new();
+        match parser.parse(&frame) {
+            FrameParserResult::Ready { msg, .. } => msg.payload.to_vec(),
+            _ => panic!("frame did not parse"),
+        }
+    }
+
+    #[test]
+    fn v1_get_anc_status() {
+        assert_eq!(v1_payload(Command::GetAncStatus), vec![0x66, 0x02]);
+    }
+
+    #[test]
+    fn v1_get_codec() {
+        assert_eq!(v1_payload(Command::GetCodec), vec![0x18, 0x00]);
+    }
+
+    #[test]
+    fn v1_get_battery() {
+        assert_eq!(
+            v1_payload(Command::GetBatteryStatus { battery_type: BatteryType::Headphones }),
+            vec![0x10, 0x01]
+        );
+        assert_eq!(
+            v1_payload(Command::GetBatteryStatus { battery_type: BatteryType::Case }),
+            vec![0x10, 0x02]
+        );
+    }
+
+    #[test]
+    fn v1_get_equalizer() {
+        assert_eq!(v1_payload(Command::GetEqualizerSettings), vec![0x56, 0x01]);
+    }
+
+    #[test]
+    fn v1_set_equalizer_preset() {
+        assert_eq!(
+            v1_payload(Command::ChangeEqualizerPreset { preset: EqualizerPreset::Bright }),
+            vec![0x58, 0x01, 0x10, 0x00]
+        );
+        assert_eq!(
+            v1_payload(Command::ChangeEqualizerPreset { preset: EqualizerPreset::Off }),
+            vec![0x58, 0x01, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn v1_set_equalizer_custom_bands() {
+        // Golden: bands=[0,0,0,0,0] bass=0 -> 58:01:ff:06:0a:0a:0a:0a:0a:0a
+        assert_eq!(
+            v1_payload(Command::ChangeEqualizerSetting {
+                preset: EqualizerPreset::Manual,
+                bass_level: 0,
+                band_400: 0,
+                band_1000: 0,
+                band_2500: 0,
+                band_6300: 0,
+                band_16000: 0,
+            }),
+            vec![0x58, 0x01, 0xff, 0x06, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a]
+        );
+        // Golden: bands=[10,0,3,0,5] bass=-2 -> 58:01:ff:06:08:14:0a:0d:0a:0f
+        assert_eq!(
+            v1_payload(Command::ChangeEqualizerSetting {
+                preset: EqualizerPreset::Manual,
+                bass_level: -2,
+                band_400: 10,
+                band_1000: 0,
+                band_2500: 3,
+                band_6300: 0,
+                band_16000: 5,
+            }),
+            vec![0x58, 0x01, 0xff, 0x06, 0x08, 0x14, 0x0a, 0x0d, 0x0a, 0x0f]
+        );
+    }
+
     #[test]
     fn init() {
         // taken from hci logs
         let bytes = [0x3e, 0xc, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0xe, 0x3c];
         assert_eq!(
             bytes.as_slice(),
-            build_command(&Command::Init, 0).unwrap().as_slice()
+            build_command(&Command::Init, 0, ProtocolVersion::V2)
+                .unwrap()
+                .as_slice()
         );
     }
     #[test]
@@ -324,7 +457,7 @@ mod test {
         // taken from hci logs
         let ack = [0x3e, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x3c];
         let init_seq_num = 1;
-        let our_ack = build_command(&Command::Ack, init_seq_num).unwrap();
+        let our_ack = build_command(&Command::Ack, init_seq_num, ProtocolVersion::V2).unwrap();
         assert_eq!(ack.as_slice(), our_ack.as_slice());
     }
 }

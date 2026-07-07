@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use sony_wf1000xm5::{
+    ProtocolVersion,
     command::{AncMode, BatteryType, Command, EqualizerPreset},
     frame_parser::{FrameParser, FrameParserResult},
     payload::{BatteryLevel, Payload, parse_payload},
@@ -200,6 +201,7 @@ struct SonyClient {
     frame_parser: FrameParser,
     seq_number: u8,
     waiting_for_ack: bool,
+    version: ProtocolVersion,
 }
 
 #[tokio::main]
@@ -568,6 +570,7 @@ async fn connect(device_hint: &Option<String>) -> Result<Option<SonyClient>> {
         frame_parser: FrameParser::new(),
         seq_number: 0,
         waiting_for_ack: false,
+        version: ProtocolVersion::V2,
     };
 
     client.send_command(Command::Init).await?;
@@ -584,7 +587,7 @@ impl SonyClient {
         if self.waiting_for_ack {
             return Err(anyhow!("still waiting for ack from previous command"));
         }
-        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number)
+        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number, self.version)
             .context("failed to build command")?;
         self.waiting_for_ack = !matches!(command, Command::Ack);
         self.stream
@@ -649,9 +652,11 @@ impl SonyClient {
                             };
 
                             // respond with ACK
-                            if let Ok(ack) =
-                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                            {
+                            if let Ok(ack) = sony_wf1000xm5::command::build_command(
+                                &Command::Ack,
+                                msg.seq_num,
+                                self.version,
+                            ) {
                                 let _ = self.stream.write_all(&ack).await;
                             }
 
@@ -870,9 +875,11 @@ impl SonyClient {
                             }
                         };
 
-                        if let Ok(ack) =
-                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                        {
+                        if let Ok(ack) = sony_wf1000xm5::command::build_command(
+                            &Command::Ack,
+                            msg.seq_num,
+                            self.version,
+                        ) {
                             let _ = self.stream.write_all(&ack).await;
                         }
 
