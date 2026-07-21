@@ -229,6 +229,19 @@ struct AncState {
     ambient_level: u8,
 }
 
+/// Aggregated state the `watch` daemon renders: ANC mode plus the most recently
+/// seen battery levels. `mode == None` means disconnected. Battery fields are
+/// filled once on connect and then only updated from the buds' push
+/// notifications, so the daemon never polls — polling glitches audio on the XM3.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WatchState {
+    mode: Option<AncCliMode>,
+    ambient_level: u8,
+    left: Option<usize>,
+    right: Option<usize>,
+    case: Option<usize>,
+}
+
 struct SonyClient {
     _session: Session,
     _profile: ProfileHandle,
@@ -355,17 +368,41 @@ async fn run() -> Result<()> {
 
 /// Whether a new ANC mode differs from the last emitted one (dedupes output,
 /// including repeated disconnected states represented as `None`).
-fn should_emit(last: Option<AncCliMode>, new: Option<AncCliMode>) -> bool {
-    last != new
+/// Render the combined watch state (ANC mode + battery) for Waybar. `mode == None`
+/// renders the disconnected state.
+fn render_watch(state: &WatchState) -> WaybarOutput {
+    let Some(mode) = state.mode else {
+        return WaybarOutput {
+            text: String::new(),
+            tooltip: "WF-1000XM5 not connected".into(),
+            class: "disconnected".into(),
+        };
+    };
+    let (text, class) = match mode {
+        // Icons chosen from the common Font Awesome set that ships with Nerd Fonts.
+        AncCliMode::Anc => ("\u{f025}".to_string(), "anc".to_string()), // headphones
+        AncCliMode::Ambient => ("\u{f028}".to_string(), "ambient".to_string()), // volume-up
+        AncCliMode::Off => ("\u{f05e}".to_string(), "anc-off".to_string()), // ban
+    };
+    let mut tooltip = format!("ANC: {mode:?}");
+    if let (Some(l), Some(r)) = (state.left, state.right) {
+        tooltip.push_str(&format!("\nL: {l}%  R: {r}%"));
+    }
+    if let Some(c) = state.case {
+        tooltip.push_str(&format!("\nCase: {c}%"));
+    }
+    WaybarOutput {
+        text,
+        tooltip,
+        class,
+    }
 }
 
-/// Emit a Waybar line only when the ANC mode changed since the last emission.
-/// `None` represents the disconnected state.
-fn emit_anc_if_changed(last: &mut Option<AncCliMode>, state: Option<&AncState>) {
-    let mode = state.map(|s| s.mode);
-    if should_emit(*last, mode) {
-        *last = mode;
-        print_output(state.cloned());
+/// Emit a Waybar line only when the watch state changed since the last emission.
+fn emit_watch_if_changed(last: &mut WatchState, new: &WatchState) {
+    if last != new {
+        *last = new.clone();
+        emit(render_watch(new));
     }
 }
 
@@ -532,24 +569,38 @@ async fn run_watch(
 
     let mut sig_next = signal(SignalKind::user_defined1())?;
     let mut sig_prev = signal(SignalKind::user_defined2())?;
-    let mut last: Option<AncCliMode> = None;
-    let mut current_level: u8 = DEFAULT_AMBIENT_LEVEL;
+    let mut last_emitted = WatchState::default();
 
-    // Emit the disconnected state immediately on startup. Without this, the
-    // `last == None` sentinel collides with the disconnected state (also `None`),
-    // so `emit_anc_if_changed(.., None)` would suppress the first line and the
-    // bar would stay empty until the buds connect.
-    print_output(None);
+    // Emit the disconnected state immediately on startup. Without this, the first
+    // disconnected state (equal to the default `last_emitted`) would be suppressed
+    // by the change check and the bar would stay empty until the buds connect.
+    emit(render_watch(&WatchState::default()));
 
     loop {
         match connect(target, version_override).await {
             Ok(Some(mut client)) => {
-                if let Ok(state) = client.fetch_anc_status().await {
-                    current_level = state.ambient_level;
-                    emit_anc_if_changed(&mut last, Some(&state));
+                // Pull ANC + battery ONCE on connect. Afterwards the loop only
+                // listens for pushed notifications, so the control channel stays
+                // quiet and audio isn't disturbed.
+                let mut state = WatchState::default();
+                if let Ok(anc) = client.fetch_anc_status().await {
+                    state.mode = Some(anc.mode);
+                    state.ambient_level = anc.ambient_level;
                 }
+                if let Ok(BatteryLevel::Headphones { left, right }) =
+                    client.fetch_battery(BatteryType::Headphones).await
+                {
+                    state.left = Some(left);
+                    state.right = Some(right);
+                }
+                if let Ok(BatteryLevel::Case(case)) = client.fetch_battery(BatteryType::Case).await
+                {
+                    state.case = Some(case);
+                }
+                emit_watch_if_changed(&mut last_emitted, &state);
+
                 if let Err(e) = client
-                    .watch_loop(&mut sig_next, &mut sig_prev, &mut last, &mut current_level)
+                    .watch_loop(&mut sig_next, &mut sig_prev, &mut state, &mut last_emitted)
                     .await
                 {
                     eprintln!("sony-anc watch: {e}");
@@ -559,7 +610,7 @@ async fn run_watch(
             Err(e) => eprintln!("sony-anc watch: connect failed: {e}"),
         }
         // Mark disconnected (emits once) and back off before reconnecting.
-        emit_anc_if_changed(&mut last, None);
+        emit_watch_if_changed(&mut last_emitted, &WatchState::default());
         time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -912,8 +963,9 @@ impl SonyClient {
 
     /// Feed received bytes through the frame parser, ack any command payloads,
     /// and return the most recent ANC state observed in this chunk (if any).
-    async fn process_bytes(&mut self, bytes: &[u8]) -> Result<Option<AncState>> {
-        let mut latest: Option<AncState> = None;
+    /// Feed received bytes through the frame parser, ack command payloads, and fold
+    /// any ANC-status or battery payloads into `state`.
+    async fn process_bytes(&mut self, bytes: &[u8], state: &mut WatchState) -> Result<()> {
         for byte in bytes {
             match self.frame_parser.parse(std::slice::from_ref(byte)) {
                 FrameParserResult::Ready { msg, .. } => {
@@ -948,16 +1000,23 @@ impl SonyClient {
                             let _ = self.stream.write_all(&ack).await;
                         }
 
-                        if let Payload::AncStatus {
-                            mode,
-                            ambient_sound_level,
-                            ..
-                        } = payload
-                        {
-                            latest = Some(AncState {
-                                mode: AncCliMode::from_anc_mode(mode),
-                                ambient_level: ambient_sound_level,
-                            });
+                        match payload {
+                            Payload::AncStatus {
+                                mode,
+                                ambient_sound_level,
+                                ..
+                            } => {
+                                state.mode = Some(AncCliMode::from_anc_mode(mode));
+                                state.ambient_level = ambient_sound_level;
+                            }
+                            Payload::BatteryLevel(BatteryLevel::Headphones { left, right }) => {
+                                state.left = Some(left);
+                                state.right = Some(right);
+                            }
+                            Payload::BatteryLevel(BatteryLevel::Case(case)) => {
+                                state.case = Some(case);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -967,15 +1026,15 @@ impl SonyClient {
                 }
             }
         }
-        Ok(latest)
+        Ok(())
     }
 
     async fn watch_loop(
         &mut self,
         sig_next: &mut tokio::signal::unix::Signal,
         sig_prev: &mut tokio::signal::unix::Signal,
-        last: &mut Option<AncCliMode>,
-        current_level: &mut u8,
+        state: &mut WatchState,
+        last_emitted: &mut WatchState,
     ) -> Result<()> {
         let mut buf = [0u8; 64];
         loop {
@@ -985,27 +1044,27 @@ impl SonyClient {
                     if n == 0 {
                         return Err(anyhow!("connection closed"));
                     }
-                    if let Some(state) = self.process_bytes(&buf[..n]).await? {
-                        *current_level = state.ambient_level;
-                        emit_anc_if_changed(last, Some(&state));
-                    }
+                    self.process_bytes(&buf[..n], state).await?;
+                    emit_watch_if_changed(last_emitted, state);
                 }
                 _ = sig_next.recv() => {
-                    let next = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
-                    match self.set_mode(next, *current_level, None, None).await {
-                        Ok(state) => {
-                            *current_level = state.ambient_level;
-                            emit_anc_if_changed(last, Some(&state));
+                    let next = cycle_mode(state.mode.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
+                    match self.set_mode(next, state.ambient_level, None, None).await {
+                        Ok(s) => {
+                            state.mode = Some(s.mode);
+                            state.ambient_level = s.ambient_level;
+                            emit_watch_if_changed(last_emitted, state);
                         }
                         Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
                 }
                 _ = sig_prev.recv() => {
-                    let prev = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
-                    match self.set_mode(prev, *current_level, None, None).await {
-                        Ok(state) => {
-                            *current_level = state.ambient_level;
-                            emit_anc_if_changed(last, Some(&state));
+                    let prev = cycle_mode(state.mode.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
+                    match self.set_mode(prev, state.ambient_level, None, None).await {
+                        Ok(s) => {
+                            state.mode = Some(s.mode);
+                            state.ambient_level = s.ambient_level;
+                            emit_watch_if_changed(last_emitted, state);
                         }
                         Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
@@ -1168,11 +1227,37 @@ mod tests {
     }
 
     #[test]
-    fn should_emit_only_on_change() {
-        assert!(should_emit(None, Some(AncCliMode::Anc)));
-        assert!(should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Off)));
-        assert!(should_emit(Some(AncCliMode::Anc), None));
-        assert!(!should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Anc)));
-        assert!(!should_emit(None, None));
+    fn render_watch_disconnected() {
+        let out = render_watch(&WatchState::default());
+        assert_eq!(out.class, "disconnected");
+        assert_eq!(out.text, "");
+    }
+
+    #[test]
+    fn render_watch_anc_with_battery() {
+        let state = WatchState {
+            mode: Some(AncCliMode::Anc),
+            ambient_level: 0,
+            left: Some(70),
+            right: Some(50),
+            case: Some(30),
+        };
+        let out = render_watch(&state);
+        assert_eq!(out.class, "anc");
+        assert!(out.tooltip.contains("ANC: Anc"));
+        assert!(out.tooltip.contains("L: 70%"));
+        assert!(out.tooltip.contains("R: 50%"));
+        assert!(out.tooltip.contains("Case: 30%"));
+    }
+
+    #[test]
+    fn render_watch_omits_missing_battery() {
+        let state = WatchState {
+            mode: Some(AncCliMode::Off),
+            ..Default::default()
+        };
+        let out = render_watch(&state);
+        assert_eq!(out.class, "anc-off");
+        assert_eq!(out.tooltip, "ANC: Off");
     }
 }
