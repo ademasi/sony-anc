@@ -22,6 +22,15 @@ const SONY_SERVICE_UUID_V1: Uuid = Uuid::from_u128(0x96CC203E_5068_46AD_B32D_E31
 const SONY_SERVICE_UUID_V2: Uuid = Uuid::from_u128(0x956C7B26_D49A_4BA8_B03F_B17D393CB6E2);
 const DEFAULT_AMBIENT_LEVEL: u8 = 10;
 
+// Reconnect pacing for `watch`. Every connection attempt makes BlueZ page the
+// device over BR/EDR, which monopolises the (single, shared) Bluetooth radio and
+// starves other devices — mice and keyboards visibly stutter. A fixed short retry
+// therefore has to be avoided: attempts back off exponentially up to the cap, and
+// `wait_before_retry` wakes early when BlueZ reports device activity, so backing
+// off far does not cost responsiveness.
+const RETRY_BACKOFF_START: Duration = Duration::from_secs(5);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -560,6 +569,46 @@ fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
 }
 
 /// Long-lived watch loop: hold one connection, stream ANC changes to stdout,
+/// Double the retry delay, saturating at `RETRY_BACKOFF_MAX`.
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RETRY_BACKOFF_MAX)
+}
+
+/// Pause before the next reconnect attempt.
+///
+/// Waits at least `RETRY_BACKOFF_START` (so a burst of BlueZ events can never turn
+/// this into a hot loop), then waits out the rest of `backoff` — but returns early
+/// if the target device reports any property change, which is what happens when the
+/// buds actually connect. That keeps the radio quiet while they are away without
+/// making reconnection slow when they come back.
+async fn wait_before_retry(device_hint: &Option<String>, backoff: Duration) {
+    let floor = backoff.min(RETRY_BACKOFF_START);
+    time::sleep(floor).await;
+    let Some(remaining) = backoff.checked_sub(floor).filter(|r| !r.is_zero()) else {
+        return;
+    };
+
+    // The session and device must stay alive for as long as the event stream is used.
+    let watched = async {
+        let session = Session::new().await.ok()?;
+        let adapter = session.default_adapter().await.ok()?;
+        let device = find_device(&adapter, device_hint.as_deref()).await.ok()??;
+        let events = device.events().await.ok()?;
+        Some((session, device, events))
+    }
+    .await;
+
+    match watched {
+        Some((_session, _device, mut events)) => {
+            tokio::select! {
+                _ = time::sleep(remaining) => {}
+                _ = events.next() => {}
+            }
+        }
+        None => time::sleep(remaining).await,
+    }
+}
+
 /// react to SIGUSR1 (cycle next) / SIGUSR2 (cycle prev), and reconnect forever.
 async fn run_watch(
     target: &Option<String>,
@@ -570,6 +619,7 @@ async fn run_watch(
     let mut sig_next = signal(SignalKind::user_defined1())?;
     let mut sig_prev = signal(SignalKind::user_defined2())?;
     let mut last_emitted = WatchState::default();
+    let mut backoff = RETRY_BACKOFF_START;
 
     // Emit the disconnected state immediately on startup. Without this, the first
     // disconnected state (equal to the default `last_emitted`) would be suppressed
@@ -579,6 +629,8 @@ async fn run_watch(
     loop {
         match connect(target, version_override).await {
             Ok(Some(mut client)) => {
+                // Reached the device: go back to retrying promptly.
+                backoff = RETRY_BACKOFF_START;
                 // Pull ANC + battery ONCE on connect. Afterwards the loop only
                 // listens for pushed notifications, so the control channel stays
                 // quiet and audio isn't disturbed.
@@ -611,7 +663,14 @@ async fn run_watch(
         }
         // Mark disconnected (emits once) and back off before reconnecting.
         emit_watch_if_changed(&mut last_emitted, &WatchState::default());
-        time::sleep(Duration::from_secs(5)).await;
+        if backoff > RETRY_BACKOFF_START {
+            eprintln!(
+                "sony-anc watch: device unavailable, next attempt in {}s",
+                backoff.as_secs()
+            );
+        }
+        wait_before_retry(target, backoff).await;
+        backoff = next_backoff(backoff);
     }
 }
 
@@ -1224,6 +1283,21 @@ mod tests {
     fn merge_bands_no_overrides_keeps_base() {
         let base = [0i8, 0, 0, 0, 0, 0];
         assert_eq!(merge_bands(base, [None; 6]), base);
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(next_backoff(RETRY_BACKOFF_START), Duration::from_secs(10));
+        assert_eq!(
+            next_backoff(Duration::from_secs(10)),
+            Duration::from_secs(20)
+        );
+        // Never exceeds the cap, and is idempotent once there.
+        assert_eq!(next_backoff(RETRY_BACKOFF_MAX), RETRY_BACKOFF_MAX);
+        assert_eq!(
+            next_backoff(RETRY_BACKOFF_MAX / 2 + Duration::from_secs(1)),
+            RETRY_BACKOFF_MAX
+        );
     }
 
     #[test]
