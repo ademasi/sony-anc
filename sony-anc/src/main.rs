@@ -597,20 +597,11 @@ async fn run_watch(
     // by the change check and the bar would stay empty until the buds connect.
     emit(render_watch(&WatchState::default()));
 
-    // Register both Sony control-channel UUIDs once, for the lifetime of the
-    // process: v1 devices (WF-1000XM3) and v2 devices (WF-1000XM5) use different
-    // ones, and registering costs nothing on the radio.
     let session = Session::new().await?;
-    let mut profile_v1 = session
-        .register_profile(sony_profile(SONY_SERVICE_UUID_V1))
-        .await?;
-    let mut profile_v2 = session
-        .register_profile(sony_profile(SONY_SERVICE_UUID_V2))
-        .await?;
 
     loop {
         // Block until the buds give us the control channel.
-        let stream = wait_for_channel(&session, target, &mut profile_v1, &mut profile_v2).await?;
+        let stream = wait_for_channel(&session, target).await?;
 
         let mut client = SonyClient {
             _session: None,
@@ -666,26 +657,8 @@ async fn connect(
         return Ok(None);
     }
 
-    // Pick the Sony RFCOMM service UUID the device actually advertises: v1 devices
-    // (WF-1000XM3) and v2 devices (WF-1000XM5) use different UUIDs. Prefer v2, fall
-    // back to v1, then default to v2.
-    let advertised = device.uuids().await.ok().flatten().unwrap_or_default();
-    let service_uuid = if advertised.contains(&SONY_SERVICE_UUID_V2) {
-        SONY_SERVICE_UUID_V2
-    } else if advertised.contains(&SONY_SERVICE_UUID_V1) {
-        SONY_SERVICE_UUID_V1
-    } else {
-        SONY_SERVICE_UUID_V2
-    };
-
-    let profile = Profile {
-        uuid: service_uuid,
-        role: Some(Role::Client),
-        auto_connect: Some(true),
-        ..Default::default()
-    };
-
-    let mut profile_handle = session.register_profile(profile).await?;
+    let service_uuid = sony_service_uuid(&device).await;
+    let mut profile_handle = session.register_profile(sony_profile(service_uuid)).await?;
 
     // Ensure the base BT connection is active before waiting for RFCOMM.
     let _ = device.connect().await;
@@ -716,12 +689,18 @@ async fn connect(
     Ok(Some(client))
 }
 
-/// How long the daemon must wait between asking BlueZ to open the control channel.
-/// Stops a burst of device property changes from turning into repeated attempts.
-const NUDGE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// Backstop for the (unlikely) case where the buds reconnect without BlueZ emitting
 /// any property change we can see.
 const NUDGE_FALLBACK: Duration = Duration::from_secs(300);
+
+/// How long to wait before re-asking BlueZ to open the channel after a failed
+/// attempt: 5s, 10s, 20s, 40s, then a 60s ceiling. Quick enough to ride out the
+/// transient `br-connection-busy` right after the buds reconnect, bounded so a
+/// device that simply cannot be reached is not retried in a hot loop.
+fn nudge_retry_delay(fail_streak: u32) -> Duration {
+    let step = fail_streak.saturating_sub(1).min(4);
+    Duration::from_secs((5u64 << step).min(60))
+}
 
 /// The Sony control-channel UUID a device actually advertises: v1 devices
 /// (WF-1000XM3) and v2 devices (WF-1000XM5) use different ones.
@@ -750,29 +729,43 @@ async fn lookup_device(session: &Session, device_hint: &Option<String>) -> Optio
 /// device is present asks BlueZ to connect *just* our profile. That is one targeted
 /// action per connection rather than a poll, and because the device is already
 /// linked at that point it does not make the controller page anything.
-async fn wait_for_channel(
-    session: &Session,
-    device_hint: &Option<String>,
-    profile_v1: &mut ProfileHandle,
-    profile_v2: &mut ProfileHandle,
-) -> Result<Stream> {
-    let mut last_nudge: Option<Instant> = None;
+async fn wait_for_channel(session: &Session, device_hint: &Option<String>) -> Result<Stream> {
+    let mut fail_streak: u32 = 0;
 
     loop {
+        // Cheap DBus lookup; costs no radio traffic.
         let device = lookup_device(session, device_hint).await;
+        let connected = match &device {
+            Some(dev) => dev.is_connected().await.unwrap_or(false),
+            None => false,
+        };
 
-        if let Some(dev) = &device
-            && dev.is_connected().await.unwrap_or(false)
-            && last_nudge.is_none_or(|t| t.elapsed() >= NUDGE_MIN_INTERVAL)
-        {
-            last_nudge = Some(Instant::now());
-            let uuid = sony_service_uuid(dev).await;
-            let _ = dev.connect_profile(&uuid).await;
-        }
+        // Registering the profile is what actually makes BlueZ hand us the channel
+        // for a device that is already connected — `auto_connect` only fires at
+        // registration time, not when the device later reconnects, and
+        // `connect_profile` is frequently refused with `br-connection-busy` while
+        // the audio profiles are still coming up. So we re-register each time round
+        // instead. Registration is a local DBus call; it only reaches the air when a
+        // device is actually there to connect to.
+        let mut profile_v1 = session
+            .register_profile(sony_profile(SONY_SERVICE_UUID_V1))
+            .await?;
+        let mut profile_v2 = session
+            .register_profile(sony_profile(SONY_SERVICE_UUID_V2))
+            .await?;
 
         let mut events = match &device {
             Some(dev) => dev.events().await.ok(),
             None => None,
+        };
+
+        // While the buds are present but have not given us a channel, retry on a
+        // bounded backoff. While they are absent there is nothing to retry, so just
+        // sleep until BlueZ says something changed.
+        let wait = if connected {
+            nudge_retry_delay(fail_streak.saturating_add(1))
+        } else {
+            NUDGE_FALLBACK
         };
 
         let request = tokio::select! {
@@ -786,7 +779,7 @@ async fn wait_for_channel(
                     None => std::future::pending::<()>().await,
                 }
             } => None,
-            _ = time::sleep(NUDGE_FALLBACK) => None,
+            _ = time::sleep(wait) => None,
         };
 
         if let Some(request) = request {
@@ -795,6 +788,13 @@ async fn wait_for_channel(
                 Err(e) => eprintln!("sony-anc watch: failed to accept connection: {e}"),
             }
         }
+
+        fail_streak = if connected {
+            fail_streak.saturating_add(1)
+        } else {
+            0
+        };
+        // The profile handles drop here, so the next pass re-registers them.
     }
 }
 
@@ -1383,6 +1383,17 @@ mod tests {
     fn merge_bands_no_overrides_keeps_base() {
         let base = [0i8, 0, 0, 0, 0, 0];
         assert_eq!(merge_bands(base, [None; 6]), base);
+    }
+
+    #[test]
+    fn nudge_retry_backs_off_and_caps() {
+        assert_eq!(nudge_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(nudge_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(nudge_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(nudge_retry_delay(4), Duration::from_secs(40));
+        // Ceiling, and stable however long the streak runs.
+        assert_eq!(nudge_retry_delay(5), Duration::from_secs(60));
+        assert_eq!(nudge_retry_delay(99), Duration::from_secs(60));
     }
 
     #[test]
