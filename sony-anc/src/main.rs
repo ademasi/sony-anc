@@ -583,7 +583,7 @@ fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
 /// forcing connections makes the controller page the device, which starves other
 /// Bluetooth devices. Staying passive avoids both.
 async fn run_watch(
-    _target: &Option<String>,
+    target: &Option<String>,
     version_override: Option<ProtocolVersion>,
 ) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -609,23 +609,8 @@ async fn run_watch(
         .await?;
 
     loop {
-        // Block until the buds open the control channel. Waiting is free, so there
-        // is no timeout and no retry schedule to get stuck in.
-        let request = tokio::select! {
-            r = profile_v1.next() => r,
-            r = profile_v2.next() => r,
-        };
-        let Some(request) = request else {
-            return Err(anyhow!("bluetooth profile registration ended"));
-        };
-
-        let stream = match request.accept() {
-            Ok(stream) => stream,
-            Err(e) => {
-                eprintln!("sony-anc watch: failed to accept connection: {e}");
-                continue;
-            }
-        };
+        // Block until the buds give us the control channel.
+        let stream = wait_for_channel(&session, target, &mut profile_v1, &mut profile_v2).await?;
 
         let mut client = SonyClient {
             _session: None,
@@ -731,6 +716,88 @@ async fn connect(
     Ok(Some(client))
 }
 
+/// How long the daemon must wait between asking BlueZ to open the control channel.
+/// Stops a burst of device property changes from turning into repeated attempts.
+const NUDGE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+/// Backstop for the (unlikely) case where the buds reconnect without BlueZ emitting
+/// any property change we can see.
+const NUDGE_FALLBACK: Duration = Duration::from_secs(300);
+
+/// The Sony control-channel UUID a device actually advertises: v1 devices
+/// (WF-1000XM3) and v2 devices (WF-1000XM5) use different ones.
+async fn sony_service_uuid(device: &Device) -> Uuid {
+    let advertised = device.uuids().await.ok().flatten().unwrap_or_default();
+    if advertised.contains(&SONY_SERVICE_UUID_V2) {
+        SONY_SERVICE_UUID_V2
+    } else if advertised.contains(&SONY_SERVICE_UUID_V1) {
+        SONY_SERVICE_UUID_V1
+    } else {
+        SONY_SERVICE_UUID_V2
+    }
+}
+
+/// Locate the target device. This is a pure DBus lookup — it costs no radio traffic.
+async fn lookup_device(session: &Session, device_hint: &Option<String>) -> Option<Device> {
+    let adapter = session.default_adapter().await.ok()?;
+    find_device(&adapter, device_hint.as_deref()).await.ok()?
+}
+
+/// Wait for the buds to give us a control channel.
+///
+/// BlueZ only auto-connects a registered profile at registration time, not when the
+/// device later reconnects, so waiting alone would miss every reconnect. Instead the
+/// daemon watches the device's DBus properties — free, no radio — and when the
+/// device is present asks BlueZ to connect *just* our profile. That is one targeted
+/// action per connection rather than a poll, and because the device is already
+/// linked at that point it does not make the controller page anything.
+async fn wait_for_channel(
+    session: &Session,
+    device_hint: &Option<String>,
+    profile_v1: &mut ProfileHandle,
+    profile_v2: &mut ProfileHandle,
+) -> Result<Stream> {
+    let mut last_nudge: Option<Instant> = None;
+
+    loop {
+        let device = lookup_device(session, device_hint).await;
+
+        if let Some(dev) = &device
+            && dev.is_connected().await.unwrap_or(false)
+            && last_nudge.is_none_or(|t| t.elapsed() >= NUDGE_MIN_INTERVAL)
+        {
+            last_nudge = Some(Instant::now());
+            let uuid = sony_service_uuid(dev).await;
+            let _ = dev.connect_profile(&uuid).await;
+        }
+
+        let mut events = match &device {
+            Some(dev) => dev.events().await.ok(),
+            None => None,
+        };
+
+        let request = tokio::select! {
+            r = profile_v1.next() => r,
+            r = profile_v2.next() => r,
+            // Any device property change (connecting, services resolving, ...) is a
+            // hint that it is worth trying again.
+            _ = async {
+                match events.as_mut() {
+                    Some(e) => { e.next().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => None,
+            _ = time::sleep(NUDGE_FALLBACK) => None,
+        };
+
+        if let Some(request) = request {
+            match request.accept() {
+                Ok(stream) => return Ok(stream),
+                Err(e) => eprintln!("sony-anc watch: failed to accept connection: {e}"),
+            }
+        }
+    }
+}
+
 /// Registration for one of Sony's RFCOMM control-channel UUIDs. Registering is a
 /// local DBus operation and costs no radio traffic; with `auto_connect` BlueZ hands
 /// us the channel whenever the device brings it up, so we never have to force a
@@ -824,15 +891,8 @@ impl SonyClient {
                         if kind == sony_wf1000xm5::MessageType::Command1
                             || kind == sony_wf1000xm5::MessageType::Command2
                         {
-                            let payload = match parse_payload(msg.payload, kind, self.version) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("bad payload: {e}");
-                                    continue;
-                                }
-                            };
-
-                            // respond with ACK
+                            // Ack first, whether or not we can interpret the payload:
+                            // unacked messages are retransmitted indefinitely.
                             if let Ok(ack) = sony_wf1000xm5::command::build_command(
                                 &Command::Ack,
                                 msg.seq_num,
@@ -840,6 +900,14 @@ impl SonyClient {
                             ) {
                                 let _ = self.stream.write_all(&ack).await;
                             }
+
+                            let payload = match parse_payload(msg.payload, kind, self.version) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    eprintln!("bad payload: {e}");
+                                    continue;
+                                }
+                            };
 
                             if predicate(&payload) {
                                 return Ok(Some(payload));
@@ -1070,14 +1138,12 @@ impl SonyClient {
                     if kind == sony_wf1000xm5::MessageType::Command1
                         || kind == sony_wf1000xm5::MessageType::Command2
                     {
-                        let payload = match parse_payload(msg.payload, kind, self.version) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("bad payload: {e}");
-                                continue;
-                            }
-                        };
-
+                        // Acknowledge receipt BEFORE trying to interpret the
+                        // contents. The device retransmits anything it has not seen
+                        // acked, so making the ack conditional on us understanding
+                        // the payload turns every unknown message type into endless
+                        // chatter on the control channel — which is audible on the
+                        // WF-1000XM3.
                         if let Ok(ack) = sony_wf1000xm5::command::build_command(
                             &Command::Ack,
                             msg.seq_num,
@@ -1085,6 +1151,14 @@ impl SonyClient {
                         ) {
                             let _ = self.stream.write_all(&ack).await;
                         }
+
+                        let payload = match parse_payload(msg.payload, kind, self.version) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("bad payload: {e}");
+                                continue;
+                            }
+                        };
 
                         match payload {
                             Payload::AncStatus {
