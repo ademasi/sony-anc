@@ -3,15 +3,6 @@
 A tiny Rust CLI to flip the ANC mode of Sony WF-1000XM5 earbuds and surface the state to Waybar.  
 All low-level protocol code is reused from [`usering-around/sony-wf1000xm5-controller`](https://github.com/usering-around/sony-wf1000xm5-controller); this project only strips the GUI away and exposes a JSON-friendly interface for bars/scripts.
 
-## Supported devices
-
-- **WF-1000XM5** (Sony protocol v2) — full support.
-- **WF-1000XM3** (Sony protocol v1) — ANC/ambient, battery, codec, and equalizer.
-  Sound-pressure readout is XM5-only.
-
-The protocol version is auto-detected from the device's init reply. Override it
-with `--model xm3|xm5` or the `SONY_WF1000XM5_MODEL=xm3|xm5` environment variable.
-
 ## Build & install
 
 ```bash
@@ -42,9 +33,6 @@ sony-anc pressure
 
 # nudge a single EQ band (writes the Manual preset, keeps other bands)
 sony-anc equalizer set --bass 3
-
-# target an XM3 explicitly (auto-detected otherwise)
-sony-anc --model xm3 status
 ```
 
 Environment override: `SONY_WF1000XM5_DEVICE` can be set to a name substring or MAC to pick the device.
@@ -91,43 +79,6 @@ disconnect, `watch` emits the `disconnected` class and reconnects automatically.
 
 > A systemd `--user` unit is intentionally **not** provided for `watch`: Waybar must
 > own the process so it can read the streamed stdout.
-
-#### Multiple monitors
-
-Waybar draws its bar (and runs each `exec`) once per output. The buds accept only
-**one** app connection, so the config above would start one `watch` daemon per
-monitor and they would fight over the connection. Instead, run a single shared
-daemon and have every bar tail its output. Save this as
-`~/.config/waybar/scripts/sony-anc-stream.sh` (`chmod +x`):
-
-```sh
-#!/bin/sh
-runtime="${XDG_RUNTIME_DIR:-/tmp}"
-state="$runtime/sony-anc.json"
-lock="$runtime/sony-anc-watch.lock"
-bin="$HOME/.local/bin/sony-anc"
-
-[ -f "$state" ] || printf '%s\n' '{"text":"","class":"disconnected"}' >"$state"
-
-# Start the shared daemon iff the lock is free. It inherits fd 9 and holds the
-# flock for its lifetime, so a second bar's non-blocking flock fails and it just
-# tails instead.
-if flock -n 9; then
-	setsid "$bin" watch >"$state" 2>"$runtime/sony-anc-watch.log" &
-fi 9>"$lock"
-
-exec tail -n1 -F "$state"
-```
-
-Then point the module's `exec` at the script (keep the same `on-click`/`on-scroll`
-signal handlers, which still target the single daemon):
-
-```jsonc
-"exec": "$HOME/.config/waybar/scripts/sony-anc-stream.sh",
-```
-
-Single-monitor setups can use the plain `exec` form above; this wrapper is only
-needed when the bar spans more than one output.
 
 ## Notes on protocol
 

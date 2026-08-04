@@ -11,15 +11,6 @@ fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0, |acc, b| acc.wrapping_add(*b))
 }
 
-/// Sony headphones speak one of two wire-protocol dialects. The framing is
-/// identical; a handful of command/response encodings differ. v1 is used by
-/// older devices (e.g. WF-1000XM3), v2 by newer ones (e.g. WF-1000XM5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProtocolVersion {
-    V1,
-    V2,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageType {
     Ack = 0x1,

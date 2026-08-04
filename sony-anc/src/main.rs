@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use sony_wf1000xm5::{
-    ProtocolVersion,
     command::{AncMode, BatteryType, Command, EqualizerPreset},
     frame_parser::{FrameParser, FrameParserResult},
     payload::{BatteryLevel, Payload, parse_payload},
@@ -15,11 +14,8 @@ use sony_wf1000xm5::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 
-const DEFAULT_DEVICE_NAME: &str = "WF-1000XM";
-// Sony's RFCOMM service UUIDs. Older protocol-v1 devices (e.g. WF-1000XM3) advertise
-// the V1 UUID; newer v2 devices (e.g. WF-1000XM5) advertise the V2 UUID.
-const SONY_SERVICE_UUID_V1: Uuid = Uuid::from_u128(0x96CC203E_5068_46AD_B32D_E316F5E069BA);
-const SONY_SERVICE_UUID_V2: Uuid = Uuid::from_u128(0x956C7B26_D49A_4BA8_B03F_B17D393CB6E2);
+const DEFAULT_DEVICE_NAME: &str = "WF-1000XM5";
+const SONY_SERVICE_UUID: Uuid = Uuid::from_u128(0x956C7B26_D49A_4BA8_B03F_B17D393CB6E2);
 const DEFAULT_AMBIENT_LEVEL: u8 = 10;
 
 #[derive(Debug, Parser)]
@@ -33,10 +29,6 @@ struct Cli {
     /// Device name (substring) or MAC address to target. Defaults to the first WF-1000XM5.
     #[arg(short, long)]
     device: Option<String>,
-
-    /// Force the protocol model instead of auto-detecting (xm3 = v1, xm5 = v2).
-    #[arg(long, value_enum)]
-    model: Option<CliModel>,
 
     #[command(subcommand)]
     action: Option<Action>,
@@ -188,34 +180,6 @@ impl AncCliMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CliModel {
-    Xm3,
-    Xm5,
-}
-
-impl From<CliModel> for ProtocolVersion {
-    fn from(m: CliModel) -> Self {
-        match m {
-            CliModel::Xm3 => ProtocolVersion::V1,
-            CliModel::Xm5 => ProtocolVersion::V2,
-        }
-    }
-}
-
-/// Parse the SONY_WF1000XM5_MODEL env override (xm3/xm5/v1/v2, case-insensitive).
-fn model_from_env() -> Option<ProtocolVersion> {
-    match std::env::var("SONY_WF1000XM5_MODEL")
-        .ok()?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "xm3" | "v1" => Some(ProtocolVersion::V1),
-        "xm5" | "v2" => Some(ProtocolVersion::V2),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct WaybarOutput {
     text: String,
@@ -229,35 +193,13 @@ struct AncState {
     ambient_level: u8,
 }
 
-/// Aggregated state the `watch` daemon renders: ANC mode plus the most recently
-/// seen battery levels. Every field is populated purely from notifications the buds
-/// push — the daemon never queries them, because any traffic on the control channel
-/// audibly disturbs playback on the WF-1000XM3. Fields therefore stay `None` until
-/// the buds first report them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WatchState {
-    /// Whether the control channel is currently open. Tracked separately from
-    /// `mode` because the daemon is passive: it knows it is connected before the
-    /// buds have pushed any state.
-    connected: bool,
-    mode: Option<AncCliMode>,
-    ambient_level: u8,
-    left: Option<usize>,
-    right: Option<usize>,
-    case: Option<usize>,
-}
-
 struct SonyClient {
-    // One-shot commands own the session/profile that produced the stream. The
-    // `watch` daemon instead keeps them alive for the whole process, so these are
-    // `None` there.
-    _session: Option<Session>,
-    _profile: Option<ProfileHandle>,
+    _session: Session,
+    _profile: ProfileHandle,
     stream: Stream,
     frame_parser: FrameParser,
     seq_number: u8,
     waiting_for_ack: bool,
-    version: ProtocolVersion,
 }
 
 #[tokio::main]
@@ -281,13 +223,12 @@ async fn run() -> Result<()> {
         .device
         .or_else(|| std::env::var("SONY_WF1000XM5_DEVICE").ok());
     let action = cli.action.unwrap_or(Action::Status);
-    let version_override = cli.model.map(ProtocolVersion::from).or_else(model_from_env);
 
     if matches!(action, Action::Watch) {
-        return run_watch(&target, version_override).await;
+        return run_watch(&target).await;
     }
 
-    let mut client = match connect(&target, version_override).await? {
+    let mut client = match connect(&target).await? {
         Some(client) => client,
         None => {
             print_output(None);
@@ -376,46 +317,17 @@ async fn run() -> Result<()> {
 
 /// Whether a new ANC mode differs from the last emitted one (dedupes output,
 /// including repeated disconnected states represented as `None`).
-/// Render the combined watch state (ANC mode + battery) for Waybar. `mode == None`
-/// renders the disconnected state.
-fn render_watch(state: &WatchState) -> WaybarOutput {
-    if !state.connected {
-        return WaybarOutput {
-            text: String::new(),
-            tooltip: "WF-1000XM5 not connected".into(),
-            class: "disconnected".into(),
-        };
-    }
-    let (text, class) = match state.mode {
-        // Icons chosen from the common Font Awesome set that ships with Nerd Fonts.
-        Some(AncCliMode::Anc) => ("\u{f025}".to_string(), "anc".to_string()), // headphones
-        Some(AncCliMode::Ambient) => ("\u{f028}".to_string(), "ambient".to_string()), // volume-up
-        Some(AncCliMode::Off) => ("\u{f05e}".to_string(), "anc-off".to_string()), // ban
-        // Connected, but the buds have not reported their mode yet.
-        None => ("\u{f025}".to_string(), "connected".to_string()),
-    };
-    let mut tooltip = match state.mode {
-        Some(mode) => format!("ANC: {mode:?}"),
-        None => "ANC: waiting for status".to_string(),
-    };
-    if let (Some(l), Some(r)) = (state.left, state.right) {
-        tooltip.push_str(&format!("\nL: {l}%  R: {r}%"));
-    }
-    if let Some(c) = state.case {
-        tooltip.push_str(&format!("\nCase: {c}%"));
-    }
-    WaybarOutput {
-        text,
-        tooltip,
-        class,
-    }
+fn should_emit(last: Option<AncCliMode>, new: Option<AncCliMode>) -> bool {
+    last != new
 }
 
-/// Emit a Waybar line only when the watch state changed since the last emission.
-fn emit_watch_if_changed(last: &mut WatchState, new: &WatchState) {
-    if last != new {
-        *last = new.clone();
-        emit(render_watch(new));
+/// Emit a Waybar line only when the ANC mode changed since the last emission.
+/// `None` represents the disconnected state.
+fn emit_anc_if_changed(last: &mut Option<AncCliMode>, state: Option<&AncState>) {
+    let mode = state.map(|s| s.mode);
+    if should_emit(*last, mode) {
+        *last = mode;
+        print_output(state.cloned());
     }
 }
 
@@ -572,77 +484,46 @@ fn cycle_mode(current: AncCliMode, direction: CycleDirection) -> AncCliMode {
     }
 }
 
-/// Long-lived watch loop: hold one connection, stream ANC changes to stdout, and
-/// react to SIGUSR1 (cycle next) / SIGUSR2 (cycle prev), forever.
-///
-/// The daemon is deliberately **passive**: it registers Sony's control-channel
-/// profiles once and then waits for BlueZ to hand it a connection. It never polls,
-/// never forces a connection, and never queries the buds for state — every value in
-/// the tooltip arrives from a notification the buds push on their own. On the
-/// WF-1000XM3 any traffic on that channel audibly disturbs A2DP playback, and
-/// forcing connections makes the controller page the device, which starves other
-/// Bluetooth devices. Staying passive avoids both.
-async fn run_watch(
-    target: &Option<String>,
-    version_override: Option<ProtocolVersion>,
-) -> Result<()> {
+/// Long-lived watch loop: hold one connection, stream ANC changes to stdout,
+/// react to SIGUSR1 (cycle next) / SIGUSR2 (cycle prev), and reconnect forever.
+async fn run_watch(target: &Option<String>) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sig_next = signal(SignalKind::user_defined1())?;
     let mut sig_prev = signal(SignalKind::user_defined2())?;
-    let mut last_emitted = WatchState::default();
+    let mut last: Option<AncCliMode> = None;
+    let mut current_level: u8 = DEFAULT_AMBIENT_LEVEL;
 
-    // Emit the disconnected state immediately on startup. Without this, the first
-    // disconnected state (equal to the default `last_emitted`) would be suppressed
-    // by the change check and the bar would stay empty until the buds connect.
-    emit(render_watch(&WatchState::default()));
-
-    let session = Session::new().await?;
+    // Emit the disconnected state immediately on startup. Without this, the
+    // `last == None` sentinel collides with the disconnected state (also `None`),
+    // so `emit_anc_if_changed(.., None)` would suppress the first line and the
+    // bar would stay empty until the buds connect.
+    print_output(None);
 
     loop {
-        // Block until the buds give us the control channel.
-        let stream = wait_for_channel(&session, target).await?;
-
-        let mut client = SonyClient {
-            _session: None,
-            _profile: None,
-            stream,
-            frame_parser: FrameParser::new(),
-            seq_number: 0,
-            waiting_for_ack: false,
-            version: version_override.unwrap_or(ProtocolVersion::V2),
-        };
-
-        // The Init exchange is the only write the daemon makes on its own; the
-        // device will not report anything until it has been greeted.
-        if let Err(e) = client.init_handshake(version_override).await {
-            eprintln!("sony-anc watch: init failed: {e}");
-            continue;
+        match connect(target).await {
+            Ok(Some(mut client)) => {
+                if let Ok(state) = client.fetch_anc_status().await {
+                    current_level = state.ambient_level;
+                    emit_anc_if_changed(&mut last, Some(&state));
+                }
+                if let Err(e) = client
+                    .watch_loop(&mut sig_next, &mut sig_prev, &mut last, &mut current_level)
+                    .await
+                {
+                    eprintln!("sony-anc watch: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("sony-anc watch: connect failed: {e}"),
         }
-
-        // Connected, but nothing is known yet — state fills in as the buds push it.
-        let mut state = WatchState {
-            connected: true,
-            ..Default::default()
-        };
-        emit_watch_if_changed(&mut last_emitted, &state);
-
-        if let Err(e) = client
-            .watch_loop(&mut sig_next, &mut sig_prev, &mut state, &mut last_emitted)
-            .await
-        {
-            eprintln!("sony-anc watch: {e}");
-        }
-
-        // Channel closed: report disconnected and go back to waiting passively.
-        emit_watch_if_changed(&mut last_emitted, &WatchState::default());
+        // Mark disconnected (emits once) and back off before reconnecting.
+        emit_anc_if_changed(&mut last, None);
+        time::sleep(Duration::from_secs(5)).await;
     }
 }
 
-async fn connect(
-    device_hint: &Option<String>,
-    version_override: Option<ProtocolVersion>,
-) -> Result<Option<SonyClient>> {
+async fn connect(device_hint: &Option<String>) -> Result<Option<SonyClient>> {
     let session = Session::new().await?;
     let adapter = match session.default_adapter().await {
         Ok(adapter) => adapter,
@@ -657,8 +538,14 @@ async fn connect(
         return Ok(None);
     }
 
-    let service_uuid = sony_service_uuid(&device).await;
-    let mut profile_handle = session.register_profile(sony_profile(service_uuid)).await?;
+    let profile = Profile {
+        uuid: SONY_SERVICE_UUID,
+        role: Some(Role::Client),
+        auto_connect: Some(true),
+        ..Default::default()
+    };
+
+    let mut profile_handle = session.register_profile(profile).await?;
 
     // Ensure the base BT connection is active before waiting for RFCOMM.
     let _ = device.connect().await;
@@ -675,167 +562,29 @@ async fn connect(
         .context("failed to accept rfcomm connection")?;
 
     let mut client = SonyClient {
-        _session: Some(session),
-        _profile: Some(profile_handle),
+        _session: session,
+        _profile: profile_handle,
         stream,
         frame_parser: FrameParser::new(),
         seq_number: 0,
         waiting_for_ack: false,
-        version: version_override.unwrap_or(ProtocolVersion::V2),
     };
 
-    client.init_handshake(version_override).await?;
+    client.send_command(Command::Init).await?;
+    client
+        .wait_for_payload(Duration::from_secs(3), |p| matches!(p, Payload::InitReply))
+        .await?
+        .ok_or_else(|| anyhow!("no init reply from device"))?;
 
     Ok(Some(client))
 }
 
-/// Backstop for the (unlikely) case where the buds reconnect without BlueZ emitting
-/// any property change we can see.
-const NUDGE_FALLBACK: Duration = Duration::from_secs(300);
-
-/// How long to wait before re-asking BlueZ to open the channel after a failed
-/// attempt: 5s, 10s, 20s, 40s, then a 60s ceiling. Quick enough to ride out the
-/// transient `br-connection-busy` right after the buds reconnect, bounded so a
-/// device that simply cannot be reached is not retried in a hot loop.
-fn nudge_retry_delay(fail_streak: u32) -> Duration {
-    let step = fail_streak.saturating_sub(1).min(4);
-    Duration::from_secs((5u64 << step).min(60))
-}
-
-/// The Sony control-channel UUID a device actually advertises: v1 devices
-/// (WF-1000XM3) and v2 devices (WF-1000XM5) use different ones.
-async fn sony_service_uuid(device: &Device) -> Uuid {
-    let advertised = device.uuids().await.ok().flatten().unwrap_or_default();
-    if advertised.contains(&SONY_SERVICE_UUID_V2) {
-        SONY_SERVICE_UUID_V2
-    } else if advertised.contains(&SONY_SERVICE_UUID_V1) {
-        SONY_SERVICE_UUID_V1
-    } else {
-        SONY_SERVICE_UUID_V2
-    }
-}
-
-/// Locate the target device. This is a pure DBus lookup — it costs no radio traffic.
-async fn lookup_device(session: &Session, device_hint: &Option<String>) -> Option<Device> {
-    let adapter = session.default_adapter().await.ok()?;
-    find_device(&adapter, device_hint.as_deref()).await.ok()?
-}
-
-/// Wait for the buds to give us a control channel.
-///
-/// BlueZ only auto-connects a registered profile at registration time, not when the
-/// device later reconnects, so waiting alone would miss every reconnect. Instead the
-/// daemon watches the device's DBus properties — free, no radio — and when the
-/// device is present asks BlueZ to connect *just* our profile. That is one targeted
-/// action per connection rather than a poll, and because the device is already
-/// linked at that point it does not make the controller page anything.
-async fn wait_for_channel(session: &Session, device_hint: &Option<String>) -> Result<Stream> {
-    let mut fail_streak: u32 = 0;
-
-    loop {
-        // Cheap DBus lookup; costs no radio traffic.
-        let device = lookup_device(session, device_hint).await;
-        let connected = match &device {
-            Some(dev) => dev.is_connected().await.unwrap_or(false),
-            None => false,
-        };
-
-        // Registering the profile is what actually makes BlueZ hand us the channel
-        // for a device that is already connected — `auto_connect` only fires at
-        // registration time, not when the device later reconnects, and
-        // `connect_profile` is frequently refused with `br-connection-busy` while
-        // the audio profiles are still coming up. So we re-register each time round
-        // instead. Registration is a local DBus call; it only reaches the air when a
-        // device is actually there to connect to.
-        let mut profile_v1 = session
-            .register_profile(sony_profile(SONY_SERVICE_UUID_V1))
-            .await?;
-        let mut profile_v2 = session
-            .register_profile(sony_profile(SONY_SERVICE_UUID_V2))
-            .await?;
-
-        let mut events = match &device {
-            Some(dev) => dev.events().await.ok(),
-            None => None,
-        };
-
-        // While the buds are present but have not given us a channel, retry on a
-        // bounded backoff. While they are absent there is nothing to retry, so just
-        // sleep until BlueZ says something changed.
-        let wait = if connected {
-            nudge_retry_delay(fail_streak.saturating_add(1))
-        } else {
-            NUDGE_FALLBACK
-        };
-
-        let request = tokio::select! {
-            r = profile_v1.next() => r,
-            r = profile_v2.next() => r,
-            // Any device property change (connecting, services resolving, ...) is a
-            // hint that it is worth trying again.
-            _ = async {
-                match events.as_mut() {
-                    Some(e) => { e.next().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => None,
-            _ = time::sleep(wait) => None,
-        };
-
-        if let Some(request) = request {
-            match request.accept() {
-                Ok(stream) => return Ok(stream),
-                Err(e) => eprintln!("sony-anc watch: failed to accept connection: {e}"),
-            }
-        }
-
-        fail_streak = if connected {
-            fail_streak.saturating_add(1)
-        } else {
-            0
-        };
-        // The profile handles drop here, so the next pass re-registers them.
-    }
-}
-
-/// Registration for one of Sony's RFCOMM control-channel UUIDs. Registering is a
-/// local DBus operation and costs no radio traffic; with `auto_connect` BlueZ hands
-/// us the channel whenever the device brings it up, so we never have to force a
-/// connection ourselves.
-fn sony_profile(uuid: Uuid) -> Profile {
-    Profile {
-        uuid,
-        role: Some(Role::Client),
-        auto_connect: Some(true),
-        ..Default::default()
-    }
-}
-
 impl SonyClient {
-    /// Perform the mandatory Init exchange. This is the one write the device
-    /// requires before it will talk to us; the protocol version is adopted from the
-    /// reply length unless the caller forced one.
-    async fn init_handshake(&mut self, version_override: Option<ProtocolVersion>) -> Result<()> {
-        self.send_command(Command::Init).await?;
-        let reply = self
-            .wait_for_payload(Duration::from_secs(3), |p| {
-                matches!(p, Payload::InitReply { .. })
-            })
-            .await?
-            .ok_or_else(|| anyhow!("no init reply from device"))?;
-        if version_override.is_none()
-            && let Payload::InitReply { version } = reply
-        {
-            self.version = version;
-        }
-        Ok(())
-    }
-
     async fn send_command(&mut self, command: Command) -> Result<()> {
         if self.waiting_for_ack {
             return Err(anyhow!("still waiting for ack from previous command"));
         }
-        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number, self.version)
+        let bytes = sony_wf1000xm5::command::build_command(&command, self.seq_number)
             .context("failed to build command")?;
         self.waiting_for_ack = !matches!(command, Command::Ack);
         self.stream
@@ -891,23 +640,20 @@ impl SonyClient {
                         if kind == sony_wf1000xm5::MessageType::Command1
                             || kind == sony_wf1000xm5::MessageType::Command2
                         {
-                            // Ack first, whether or not we can interpret the payload:
-                            // unacked messages are retransmitted indefinitely.
-                            if let Ok(ack) = sony_wf1000xm5::command::build_command(
-                                &Command::Ack,
-                                msg.seq_num,
-                                self.version,
-                            ) {
-                                let _ = self.stream.write_all(&ack).await;
-                            }
-
-                            let payload = match parse_payload(msg.payload, kind, self.version) {
+                            let payload = match parse_payload(msg.payload, kind) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("bad payload: {e}");
                                     continue;
                                 }
                             };
+
+                            // respond with ACK
+                            if let Ok(ack) =
+                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                            {
+                                let _ = self.stream.write_all(&ack).await;
+                            }
 
                             if predicate(&payload) {
                                 return Ok(Some(payload));
@@ -970,24 +716,6 @@ impl SonyClient {
             .wait_for_payload(Duration::from_millis(500), |_| false)
             .await;
         self.fetch_anc_status().await
-    }
-
-    /// Apply a mode without reading the result back.
-    ///
-    /// The `watch` daemon uses this instead of [`Self::set_mode`]: the buds push an
-    /// ANC-status notification after a change anyway, so asking for it would be a
-    /// redundant query on a channel we are trying to keep quiet. The caller updates
-    /// its state optimistically and the pushed notification corrects it if needed —
-    /// which also makes click-to-cycle feel instant.
-    async fn apply_mode(&mut self, target: AncCliMode, current_level: u8) -> Result<()> {
-        let (ambient_level, voice_passthrough) = ambient_params(target, current_level, None, None);
-        self.send_command(Command::AncSet {
-            dragging_ambient_sound_slider: false,
-            mode: target.into(),
-            ambient_sound_voice_passthrough: voice_passthrough,
-            ambient_sound_level: ambient_level as usize,
-        })
-        .await
     }
 
     async fn fetch_battery(&mut self, battery_type: BatteryType) -> Result<BatteryLevel> {
@@ -1090,9 +818,6 @@ impl SonyClient {
     }
 
     async fn fetch_sound_pressure(&mut self) -> Result<usize> {
-        if self.version == ProtocolVersion::V1 {
-            return Err(anyhow!("sound pressure is not supported on the WF-1000XM3"));
-        }
         self.send_command(Command::SoundPressureMeasure { on: true })
             .await?;
         self.wait_for_payload(Duration::from_secs(2), |p| {
@@ -1117,9 +842,8 @@ impl SonyClient {
 
     /// Feed received bytes through the frame parser, ack any command payloads,
     /// and return the most recent ANC state observed in this chunk (if any).
-    /// Feed received bytes through the frame parser, ack command payloads, and fold
-    /// any ANC-status or battery payloads into `state`.
-    async fn process_bytes(&mut self, bytes: &[u8], state: &mut WatchState) -> Result<()> {
+    async fn process_bytes(&mut self, bytes: &[u8]) -> Result<Option<AncState>> {
+        let mut latest: Option<AncState> = None;
         for byte in bytes {
             match self.frame_parser.parse(std::slice::from_ref(byte)) {
                 FrameParserResult::Ready { msg, .. } => {
@@ -1138,21 +862,7 @@ impl SonyClient {
                     if kind == sony_wf1000xm5::MessageType::Command1
                         || kind == sony_wf1000xm5::MessageType::Command2
                     {
-                        // Acknowledge receipt BEFORE trying to interpret the
-                        // contents. The device retransmits anything it has not seen
-                        // acked, so making the ack conditional on us understanding
-                        // the payload turns every unknown message type into endless
-                        // chatter on the control channel — which is audible on the
-                        // WF-1000XM3.
-                        if let Ok(ack) = sony_wf1000xm5::command::build_command(
-                            &Command::Ack,
-                            msg.seq_num,
-                            self.version,
-                        ) {
-                            let _ = self.stream.write_all(&ack).await;
-                        }
-
-                        let payload = match parse_payload(msg.payload, kind, self.version) {
+                        let payload = match parse_payload(msg.payload, kind) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("bad payload: {e}");
@@ -1160,23 +870,22 @@ impl SonyClient {
                             }
                         };
 
-                        match payload {
-                            Payload::AncStatus {
-                                mode,
-                                ambient_sound_level,
-                                ..
-                            } => {
-                                state.mode = Some(AncCliMode::from_anc_mode(mode));
-                                state.ambient_level = ambient_sound_level;
-                            }
-                            Payload::BatteryLevel(BatteryLevel::Headphones { left, right }) => {
-                                state.left = Some(left);
-                                state.right = Some(right);
-                            }
-                            Payload::BatteryLevel(BatteryLevel::Case(case)) => {
-                                state.case = Some(case);
-                            }
-                            _ => {}
+                        if let Ok(ack) =
+                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                        {
+                            let _ = self.stream.write_all(&ack).await;
+                        }
+
+                        if let Payload::AncStatus {
+                            mode,
+                            ambient_sound_level,
+                            ..
+                        } = payload
+                        {
+                            latest = Some(AncState {
+                                mode: AncCliMode::from_anc_mode(mode),
+                                ambient_level: ambient_sound_level,
+                            });
                         }
                     }
                 }
@@ -1186,15 +895,15 @@ impl SonyClient {
                 }
             }
         }
-        Ok(())
+        Ok(latest)
     }
 
     async fn watch_loop(
         &mut self,
         sig_next: &mut tokio::signal::unix::Signal,
         sig_prev: &mut tokio::signal::unix::Signal,
-        state: &mut WatchState,
-        last_emitted: &mut WatchState,
+        last: &mut Option<AncCliMode>,
+        current_level: &mut u8,
     ) -> Result<()> {
         let mut buf = [0u8; 64];
         loop {
@@ -1204,28 +913,23 @@ impl SonyClient {
                     if n == 0 {
                         return Err(anyhow!("connection closed"));
                     }
-                    self.process_bytes(&buf[..n], state).await?;
-                    emit_watch_if_changed(last_emitted, state);
+                    if let Some(state) = self.process_bytes(&buf[..n]).await? {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
+                    }
                 }
                 _ = sig_next.recv() => {
-                    let next = cycle_mode(state.mode.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
-                    match self.apply_mode(next, state.ambient_level).await {
-                        // Optimistic: the buds push the authoritative status shortly.
-                        Ok(()) => {
-                            state.mode = Some(next);
-                            emit_watch_if_changed(last_emitted, state);
-                        }
-                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
+                    let next = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
+                    if let Ok(state) = self.set_mode(next, *current_level, None, None).await {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
                     }
                 }
                 _ = sig_prev.recv() => {
-                    let prev = cycle_mode(state.mode.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
-                    match self.apply_mode(prev, state.ambient_level).await {
-                        Ok(()) => {
-                            state.mode = Some(prev);
-                            emit_watch_if_changed(last_emitted, state);
-                        }
-                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
+                    let prev = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
+                    if let Ok(state) = self.set_mode(prev, *current_level, None, None).await {
+                        *current_level = state.ambient_level;
+                        emit_anc_if_changed(last, Some(&state));
                     }
                 }
             }
@@ -1386,66 +1090,11 @@ mod tests {
     }
 
     #[test]
-    fn nudge_retry_backs_off_and_caps() {
-        assert_eq!(nudge_retry_delay(1), Duration::from_secs(5));
-        assert_eq!(nudge_retry_delay(2), Duration::from_secs(10));
-        assert_eq!(nudge_retry_delay(3), Duration::from_secs(20));
-        assert_eq!(nudge_retry_delay(4), Duration::from_secs(40));
-        // Ceiling, and stable however long the streak runs.
-        assert_eq!(nudge_retry_delay(5), Duration::from_secs(60));
-        assert_eq!(nudge_retry_delay(99), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn render_watch_disconnected() {
-        let out = render_watch(&WatchState::default());
-        assert_eq!(out.class, "disconnected");
-        assert_eq!(out.text, "");
-    }
-
-    #[test]
-    fn render_watch_anc_with_battery() {
-        let state = WatchState {
-            connected: true,
-            mode: Some(AncCliMode::Anc),
-            ambient_level: 0,
-            left: Some(70),
-            right: Some(50),
-            case: Some(30),
-        };
-        let out = render_watch(&state);
-        assert_eq!(out.class, "anc");
-        assert!(out.tooltip.contains("ANC: Anc"));
-        assert!(out.tooltip.contains("L: 70%"));
-        assert!(out.tooltip.contains("R: 50%"));
-        assert!(out.tooltip.contains("Case: 30%"));
-    }
-
-    #[test]
-    fn render_watch_connected_before_any_status() {
-        // Passive mode: connected, but the buds have not pushed anything yet.
-        let state = WatchState {
-            connected: true,
-            ..Default::default()
-        };
-        let out = render_watch(&state);
-        assert_eq!(out.class, "connected");
-        assert!(out.tooltip.contains("waiting for status"));
-        assert!(
-            !out.text.is_empty(),
-            "module must stay visible when connected"
-        );
-    }
-
-    #[test]
-    fn render_watch_omits_missing_battery() {
-        let state = WatchState {
-            connected: true,
-            mode: Some(AncCliMode::Off),
-            ..Default::default()
-        };
-        let out = render_watch(&state);
-        assert_eq!(out.class, "anc-off");
-        assert_eq!(out.tooltip, "ANC: Off");
+    fn should_emit_only_on_change() {
+        assert!(should_emit(None, Some(AncCliMode::Anc)));
+        assert!(should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Off)));
+        assert!(should_emit(Some(AncCliMode::Anc), None));
+        assert!(!should_emit(Some(AncCliMode::Anc), Some(AncCliMode::Anc)));
+        assert!(!should_emit(None, None));
     }
 }
