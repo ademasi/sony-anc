@@ -640,6 +640,13 @@ impl SonyClient {
                         if kind == sony_wf1000xm5::MessageType::Command1
                             || kind == sony_wf1000xm5::MessageType::Command2
                         {
+                            // Ack on receipt, before interpreting (see process_bytes).
+                            if let Ok(ack) =
+                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                            {
+                                let _ = self.stream.write_all(&ack).await;
+                            }
+
                             let payload = match parse_payload(msg.payload, kind) {
                                 Ok(p) => p,
                                 Err(e) => {
@@ -647,13 +654,6 @@ impl SonyClient {
                                     continue;
                                 }
                             };
-
-                            // respond with ACK
-                            if let Ok(ack) =
-                                sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                            {
-                                let _ = self.stream.write_all(&ack).await;
-                            }
 
                             if predicate(&payload) {
                                 return Ok(Some(payload));
@@ -862,6 +862,15 @@ impl SonyClient {
                     if kind == sony_wf1000xm5::MessageType::Command1
                         || kind == sony_wf1000xm5::MessageType::Command2
                     {
+                        // Ack on receipt, before interpreting: the buds retransmit
+                        // anything unacked, so an unknown payload type must still be
+                        // acknowledged.
+                        if let Ok(ack) =
+                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
+                        {
+                            let _ = self.stream.write_all(&ack).await;
+                        }
+
                         let payload = match parse_payload(msg.payload, kind) {
                             Ok(p) => p,
                             Err(e) => {
@@ -869,12 +878,6 @@ impl SonyClient {
                                 continue;
                             }
                         };
-
-                        if let Ok(ack) =
-                            sony_wf1000xm5::command::build_command(&Command::Ack, msg.seq_num)
-                        {
-                            let _ = self.stream.write_all(&ack).await;
-                        }
 
                         if let Payload::AncStatus {
                             mode,
@@ -920,16 +923,22 @@ impl SonyClient {
                 }
                 _ = sig_next.recv() => {
                     let next = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Next);
-                    if let Ok(state) = self.set_mode(next, *current_level, None, None).await {
-                        *current_level = state.ambient_level;
-                        emit_anc_if_changed(last, Some(&state));
+                    match self.set_mode(next, *current_level, None, None).await {
+                        Ok(state) => {
+                            *current_level = state.ambient_level;
+                            emit_anc_if_changed(last, Some(&state));
+                        }
+                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
                 }
                 _ = sig_prev.recv() => {
                     let prev = cycle_mode(last.unwrap_or(AncCliMode::Anc), CycleDirection::Prev);
-                    if let Ok(state) = self.set_mode(prev, *current_level, None, None).await {
-                        *current_level = state.ambient_level;
-                        emit_anc_if_changed(last, Some(&state));
+                    match self.set_mode(prev, *current_level, None, None).await {
+                        Ok(state) => {
+                            *current_level = state.ambient_level;
+                            emit_anc_if_changed(last, Some(&state));
+                        }
+                        Err(e) => eprintln!("sony-anc watch: failed to cycle ANC mode: {e:?}"),
                     }
                 }
             }
